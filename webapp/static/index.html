@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>字幕转换 · 擦除换字幕</title>
+<style>
+  :root{
+    --bg:#0f1216; --card:#171b21; --card2:#1e242c; --line:#2a3138;
+    --fg:#e8eaed; --dim:#8b949e; --accent:#4f9cf9; --ok:#3fb950; --warn:#d29922; --err:#f85149;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:14px/1.6 -apple-system,"PingFang SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  header{padding:22px 24px 6px;display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+  h1{font-size:18px;margin:0;font-weight:600}
+  .sub{color:var(--dim);font-size:12.5px}
+  main{max-width:1080px;margin:0 auto;padding:12px 20px 60px;display:grid;gap:16px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px}
+  .drop{border:1.5px dashed var(--line);border-radius:10px;padding:26px;text-align:center;
+    cursor:pointer;transition:.15s;color:var(--dim)}
+  .drop:hover,.drop.over{border-color:var(--accent);color:var(--fg);background:#141a22}
+  .drop b{color:var(--fg)}
+  .row{display:flex;gap:14px;flex-wrap:wrap;margin-top:16px}
+  label{display:flex;flex-direction:column;gap:6px;font-size:12.5px;color:var(--dim);flex:1;min-width:150px}
+  select,button{font:inherit;color:var(--fg);background:var(--card2);border:1px solid var(--line);
+    border-radius:8px;padding:9px 11px}
+  select:focus{outline:2px solid #23405f}
+  button{cursor:pointer}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+  button.primary:disabled{opacity:.45;cursor:not-allowed}
+  button.ghost{background:transparent}
+  .bar{height:7px;background:#0b0e12;border-radius:6px;overflow:hidden;margin:14px 0 8px}
+  .bar>i{display:block;height:100%;width:0;background:linear-gradient(90deg,#3d7ff0,#5ac8fa);
+    transition:width .4s}
+  .meta{display:flex;justify-content:space-between;color:var(--dim);font-size:12.5px}
+  pre.log{background:#0b0e12;border:1px solid var(--line);border-radius:8px;padding:10px;
+    height:170px;overflow:auto;font:12px/1.55 ui-monospace,Menlo,Consolas,monospace;
+    color:#9fb0c0;white-space:pre-wrap;margin:12px 0 0}
+  video{width:100%;border-radius:10px;background:#000;max-height:62vh}
+  .pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;
+    background:var(--card2);border:1px solid var(--line);color:var(--dim)}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:820px){.grid2{grid-template-columns:1fr}}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:13px}
+  .kv span:nth-child(odd){color:var(--dim)}
+  a.dl{color:var(--accent);text-decoration:none;margin-right:14px}
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  td,th{padding:6px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+  th{color:var(--dim);font-weight:500}
+  .jobs .r{cursor:pointer}
+  .jobs .r:hover{background:#1b2129}
+  .qc{display:flex;gap:8px;flex-wrap:wrap}
+  .qc figure{margin:0;width:150px}
+  .qc img{width:150px;border-radius:6px;border:1px solid var(--line);display:block}
+  .qc figcaption{font-size:11.5px;color:var(--dim);margin-top:3px}
+  .qc figure.bad img{border-color:var(--err);box-shadow:0 0 0 1px var(--err)}
+  .qc figure.bad figcaption{color:var(--err)}
+  .hidden{display:none}
+</style>
+</head>
+<body>
+<header>
+  <h1>字幕转换</h1>
+  <span class="sub">擦除原字幕 · 翻译 · 按原位置字号重新压制</span>
+  <span id="health" class="pill" style="margin-left:auto">检测环境…</span>
+</header>
+
+<main>
+  <section class="card">
+    <div id="drop" class="drop">
+      <div><b>拖视频到这里</b>，或点击选择文件</div>
+      <div style="margin-top:6px;font-size:12px">支持 mp4 / mov / mkv / webm · 竖屏横屏都行 · 手机拍的带旋转也能处理</div>
+      <input id="file" type="file" accept="video/*" class="hidden">
+    </div>
+    <div id="name" class="sub" style="margin-top:10px"></div>
+    <div class="row">
+      <label>源字幕语言
+        <select id="source">
+          <option value="auto">自动判断</option>
+          <option value="zh">中文（含繁简）</option>
+          <option value="other">英文/其他语言</option>
+        </select>
+      </label>
+      <label>目标语言
+        <select id="target">
+          <option value="en" selected>English</option>
+          <option value="zh">简体中文</option>
+          <option value="ja">日本語</option>
+          <option value="ko">한국어</option>
+          <option value="es">Español</option>
+          <option value="pt">Português</option>
+          <option value="ar">العربية</option>
+          <option value="ru">Русский</option>
+          <option value="fr">Français</option>
+          <option value="de">Deutsch</option>
+          <option value="th">ไทย</option>
+          <option value="vi">Tiếng Việt</option>
+          <option value="id">Bahasa Indonesia</option>
+        </select>
+      </label>
+      <label>擦除引擎
+        <select id="erase">
+          <option value="local">本地 GPU（免费）</option>
+          <option value="cloud_pro">云端 · 精细化（约 ¥1/分钟）</option>
+          <option value="cloud_standard">云端 · 标准版（约 ¥0.4/分钟）</option>
+        </select>
+      </label>
+      <label>&nbsp;
+        <button id="go" class="primary" disabled>开始转换</button>
+      </label>
+    </div>
+  </section>
+
+  <section id="run" class="card hidden">
+    <div class="meta"><span id="stage">准备</span><span id="pct">0%</span></div>
+    <div class="bar"><i id="fill"></i></div>
+    <div class="sub" id="hint"></div>
+    <pre id="log" class="log"></pre>
+  </section>
+
+  <section id="done" class="card hidden">
+    <div class="grid2">
+      <div><video id="out" controls playsinline></video></div>
+      <div>
+        <div class="kv" id="report"></div>
+        <div style="margin-top:14px">
+          <a id="dl" class="dl" href="#">下载视频</a>
+          <a id="dlass" class="dl" href="#">下载字幕</a>
+          <a id="dlsrc" class="dl" href="#">原始上传</a>
+        </div>
+      </div>
+    </div>
+    <div style="margin-top:16px">
+      <div class="sub" style="margin-bottom:6px">自动质检（擦除后抽帧，红框=疑似残留）</div>
+      <div id="qc" class="qc"></div>
+    </div>
+    <div style="margin-top:16px">
+      <div class="sub" style="margin-bottom:6px">逐句对照（前 30 条）</div>
+      <table id="pairs"></table>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="sub" style="margin-bottom:8px">最近的转换</div>
+    <table class="jobs" id="jobs"></table>
+  </section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+let file = null, cur = null, logOff = 0, timer = null;
+
+Promise.all([
+  fetch('/api/health').then(r=>r.json()),
+  fetch('/api/translate/check').then(r=>r.json()).catch(()=>({ok:false,detail:'不可用'}))
+]).then(([h,t])=>{
+  const er = h.erase || {};
+  $('#health').textContent = `GPU ${h.gpu||'?'} · 队列 ${h.queue??0} · 翻译 ${t.ok ? (t.model||'就绪') : '不可用'}`
+    + ` · 擦除 ${er.provider==='cloud' ? '云端' : '本地'}`;
+  if(!t.ok){ $('#health').style.color = 'var(--err)'; }
+  const want = er.provider==='cloud'
+    ? (er.quality==='standard' ? 'cloud_standard' : 'cloud_pro') : 'local';
+  $('#erase').value = want;
+  [...$('#erase').options].forEach(o=>{
+    if(o.value.startsWith('cloud')){
+      o.disabled = !er.cloud_ready;
+      if(!er.cloud_ready) o.textContent = o.textContent.replace(/（.*）$/, '（未配置 Key）');
+    }
+  });
+  if(!er.cloud_ready && want !== 'local') $('#erase').value = 'local';
+}).catch(()=>$('#health').textContent='服务未响应');
+
+const drop = $('#drop'), fi = $('#file');
+drop.onclick = ()=>fi.click();
+drop.ondragover = e=>{e.preventDefault();drop.classList.add('over')};
+drop.ondragleave = ()=>drop.classList.remove('over');
+drop.ondrop = e=>{e.preventDefault();drop.classList.remove('over');
+  if(e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0])};
+fi.onchange = ()=>fi.files[0] && setFile(fi.files[0]);
+function setFile(f){
+  file = f;
+  $('#name').textContent = `${f.name} · ${(f.size/1048576).toFixed(1)} MB`;
+  $('#go').disabled = false;
+}
+
+$('#go').onclick = async ()=>{
+  if(!file) return;
+  $('#go').disabled = true;
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('source', $('#source').value);
+  fd.append('target', $('#target').value);
+  fd.append('erase', $('#erase').value);
+  $('#run').classList.remove('hidden');
+  $('#done').classList.add('hidden');
+  $('#log').textContent = '上传中…';
+  $('#stage').textContent = '上传中';
+  const r = await fetch('/api/jobs', {method:'POST', body:fd});
+  const j = await r.json().catch(()=>({error:'服务返回异常'}));
+  if(!r.ok || !j.id){
+    $('#stage').textContent = '上传失败：' + (j.error || r.status);
+    $('#log').textContent = j.error || '';
+    $('#go').disabled = false;
+    return;
+  }
+  cur = j.id; logOff = 0; poll();
+};
+
+function poll(){
+  clearTimeout(timer);
+  fetch(`/api/jobs/${cur}?since=${logOff}`).then(r=>r.json()).then(d=>{
+    if(d.error){ $('#stage').textContent = d.error; return; }
+    const p = Math.round((d.progress||0)*100);
+    $('#fill').style.width = p+'%';
+    $('#pct').textContent = p+'%';
+    $('#stage').textContent = d.stage || d.state;
+    if(d.logs && d.logs.length){
+      const el = $('#log');
+      el.textContent += (el.textContent && !el.textContent.endsWith('\n') ? '\n':'') + d.logs.join('\n');
+      el.scrollTop = el.scrollHeight;
+      logOff = d.log_total || (logOff + d.logs.length);
+    }
+    if(d.state === 'done'){ showDone(cur, d); $('#go').disabled=false; loadJobs(); return; }
+    if(d.state === 'error'){ $('#go').disabled=false;
+      $('#stage').textContent = '出错：'+(d.error||''); loadJobs(); return; }
+    timer = setTimeout(poll, 1200);
+  }).catch(()=>{ timer = setTimeout(poll, 2500); });
+}
+
+function showDone(id, d){
+  $('#run').classList.add('hidden');
+  $('#done').classList.remove('hidden');
+  $('#out').src = `/api/jobs/${id}/video?t=${Date.now()}`;
+  $('#dl').href = `/api/jobs/${id}/video`;
+  $('#dlass').href = `/api/jobs/${id}/ass`;
+  $('#dlsrc').href = `/api/jobs/${id}/source`;
+  const r = d.report || {};
+  const L = r.layout || {};
+  const er = r.erase || {};
+  const rep = er.repair || null;
+  const repTxt = er.provider === 'cloud' ? '—'
+    : !rep ? '未启用'
+    : rep.error ? '异常，已保留首擦结果'
+    : rep.suspects_before ? `${rep.suspects_before} → ${rep.suspects_after} 处 · 重擦 ${(rep.repaired_shots||[]).length} 个镜头`
+    : `复查 ${(rep.rounds&&rep.rounds[0]&&rep.rounds[0].tracks)||0} 条 · 0 处残留`;
+  const eng = er.provider === 'cloud'
+    ? `云端${er.quality === 'standard' ? '标准版' : '精细化'} · 约 ¥${er.cost_est ?? '?'} · ${er.seconds || 0}s`
+    : `本地 GPU · ${er.mask_mode || r.mask_mode || ''}`;
+  $('#report').innerHTML = `
+    <span>分辨率</span><span>${r.resolution||''} @ ${r.fps||''}fps · ${r.duration||''}s</span>
+    <span>源 → 目标</span><span>${r.source_lang||''} → ${r.target_lang||''}</span>
+    <span>擦除引擎</span><span>${eng}</span>
+    <span>字幕条数</span><span>${r.cues||0}（译出 ${r.translated||0}）</span>
+    <span>字幕位置</span><span>${L.align===8?'顶部':'底部'} · 距${L.align===8?'上':'下'}沿 ${L.margin_v}px</span>
+    <span>字号</span><span>${r.font_size}px · 每行 ${r.max_chars} 字（原字高 ${L.font_h}px）</span>
+    <span>音轨</span><span>${r.audio ? '已保留' : '无（源文件无音轨）'}</span>
+    <span>自动质检</span><span>抽帧 ${(r.qc&&r.qc.thumbs||[]).length} 张 · 疑似残留 ${(r.qc&&r.qc.suspects||[]).length} 处</span>
+    <span>残留返修</span><span>${repTxt}</span>
+    <span>耗时</span><span>${r.seconds||0} 秒</span>`;
+  const rows = (r.pairs||[]).slice(0,30).map(([a,b,src,dst])=>
+    `<tr><td style="width:52px;color:#8b949e">${a}s</td><td>${esc(src)}</td>
+     <td style="color:#9fb0c0">${esc(dst||'')}</td></tr>`).join('');
+  $('#pairs').innerHTML = rows || '<tr><td>没有对照数据</td></tr>';
+  const qc = r.qc || {};
+  const bad = new Set((qc.suspects||[]).map(x=>x.t));
+  $('#qc').innerHTML = (qc.thumbs||[]).map(x=>
+    `<figure class="${bad.has(x.t)?'bad':''}"><img loading="lazy" src="/api/jobs/${id}/qc/${x.img}">
+     <figcaption>${x.t}s${bad.has(x.t)?' · 疑似残留':''}</figcaption></figure>`).join('')
+    || '<span class="sub">本次没有抽帧数据</span>';
+}
+
+const esc = s => (s||'').replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+function loadJobs(){
+  fetch('/api/jobs').then(r=>r.json()).then(d=>{
+    const rows = (d.jobs||[]).map(j=>{
+      const st = {done:'完成',error:'出错',running:'进行中',pending:'排队',interrupted:'中断'}[j.state]||j.state;
+      const eng = (j.erase||'').startsWith('cloud') ? ' · 云' : '';
+      return `<tr class="r" onclick="openJob('${j.id}')">
+        <td>${esc(j.name||j.id)}</td><td>${j.source||''}→${j.target||''}</td>
+        <td>${st}${eng}</td><td>${j.size_mb||''} MB</td>
+        <td>${j.state==='done'?'<a class="dl" href="/api/jobs/'+j.id+'/video">下载</a>':''}</td></tr>`;
+    }).join('');
+    $('#jobs').innerHTML = '<tr><th>文件</th><th>语言</th><th>状态</th><th>大小</th><th></th></tr>'+(rows||'');
+  });
+}
+window.openJob = id => {
+  cur = id; logOff = 0;
+  $('#run').classList.remove('hidden');
+  $('#log').textContent = '';
+  fetch(`/api/jobs/${id}?since=0`).then(r=>r.json()).then(d=>{
+    $('#log').textContent = (d.logs||[]).join('\n');
+    logOff = d.log_total||0;
+    if(d.state==='done') showDone(id,d); else poll();
+  });
+};
+loadJobs(); setInterval(loadJobs, 8000);
+</script>
+</body>
+</html>

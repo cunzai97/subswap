@@ -1,0 +1,125 @@
+# 短剧字幕逐帧擦除 · 配置
+# 所有路径按本机实际情况改
+
+paths:
+  models: ~/models/lama/big-lama.pt
+  work: /media/pan/学习/work/video-erase/work
+  out: /media/pan/学习/work/video-erase/out
+
+video:
+  fps: 25                 # 处理帧率（VFR 源先归一）
+  crf: 14                 # 段落中间片质量，接近无损
+  preset: veryfast
+  audio: copy             # 音轨始终原样保留
+
+# 擦除引擎：local=本机 LaMa；cloud=火山引擎 AI MediaKit（异步任务）
+# 网页/CLI 都可以单独覆盖，不必改这里
+erase:
+  provider: local         # local | cloud
+  engine: ref             # ref=参考帧优先（v6，默认）| legacy=逐帧 LaMa
+  ref_photo: 12.0         # 参考帧 warp 后的光度误差上限（超了走模型兜底）
+  ref_feather: 1.0        # 参考填充羽化（真实像素，收紧）
+  model_feather: 2.5      # 模型兜底羽化（放宽，压接缝）
+  model_stab: 0.45        # 只对模型兜底帧做时域稳定
+  auto_repair: true       # 本地擦除后自动 OCR 复查，只返修有残留的镜头
+  repair_rounds: 2        # 最多返修轮数（每轮全片复查一次）
+  cloud:
+    vendor: volcengine
+    quality: pro          # pro=1 元/分钟（短剧/复杂纹理）| standard=0.4 元/分钟
+    base_url: https://mediakit.cn-beijing.volces.com
+    # Key 优先读环境变量，其次 api_key，最后 api_key_file；不要把 Key 写进仓库
+    api_key_env: ERASE_CLOUD_API_KEY
+    api_key: ""
+    api_key_file: ""      # 例：~/.config/video-erase/mediakit.key
+    mode: auto            # auto=底部 Subtitle；顶部字幕自动改 Text+框选；也可强制 Subtitle/Text
+    model_version: v5.6   # 仅精细化版：v5.6 支持多语种、抗闪烁
+    region: auto          # auto=仅顶部字幕自动框选 | always | never | 坐标列表
+    poll_interval: 5      # 轮询间隔（秒）
+    timeout: 1800         # 单任务超时（秒），超时保留 task_id，避免重复计费
+    submit_extra: {}      # 透传官方参数，例如 {"output_encode_mode": "Quality"}
+
+shot:
+  scene_threshold: 27     # PySceneDetect content 检测阈值
+  min_shot_sec: 0.5       # 更短的镜头合并
+
+ocr:
+  use_cuda: true
+  sample_fps: 4
+
+vad:
+  enable: true
+  tol: 0.6              # 时间轴吸附容差（秒）
+
+translate:
+  enable: true
+  target: en              # en/zh/ja/...；CLI 可用 --target ja 覆盖，网页目标语言选「日本語」
+  style: plain            # plain=逐句直译（翻译专用模型）；json=批量 JSON（通用 LLM/网关）
+  # plain_prompt 只给英语默认；zh/ja 由代码内置提示词，按 target 自动切换
+  # 本机 Hy-MT2-7B（llama-server :1509，V100，Q4_K_M）
+  base_url: http://127.0.0.1:1509/v1
+  model: Hy-MT2-7B-Q4_K_M.gguf
+  models: []
+  api_key: local
+  api_key_file: ""
+  api_key_name: ""
+  plain_prompt: "将以下文本翻译成英语，注意只需要输出翻译后的结果，不要额外解释：\n\n{text}"
+  batch: 1
+  concurrency: 4          # llama-server -np 4
+  min_gap: 0
+  timeout: 120
+  retries: 2
+  rate_sleep: 2
+  temperature: 0.2
+  max_tokens: 512
+  # 切回 qoder2api 网关：
+  #   base_url: http://127.0.0.1:8790/v1
+  #   style: json / models: [Qwen3.8-Flash] / batch: 12 / concurrency: 1 / min_gap: 5
+  #   api_key: "" / api_key_file: ~/work/qoder-api/hub/accounts/settings.json / api_key_name: local-cn
+
+mask:
+  mode: stroke          # stroke=笔画级 | rect=矩形
+  band: [0.55, 0.95]      # 字幕带纵向范围（相对高度），超出这个范围的文字不处理
+  ocr_conf: 0.3          # 非中文行置信度低，框仍要保留
+  ocr_sample_fps: 2       # 抽样检测频率
+  mask_pad: 14            # 掩码外扩像素（吃描边/阴影）
+  cjk_only: true           # 只擦中文字幕；非中文行读不准，硬擦会闪
+  dilate: 20              # 笔画掩码膨胀：字幕白边+黑描边+抗锯齿，7 会留白边残影
+  stroke_fallback: 0.12   # 白底白字笔画漏检比例超过它就整行矩形兜底
+  expand_ratio: 0.0       # 画质优先：0.14=左右各扩 14% 补 OCR 裁掉的首尾字
+  bright_fallback: 0      # 配合 expand：首尾背景亮度≥150 时整行矩形兜底
+  mask_extra_top: 48      # 上沿额外扩，给英文两行留位
+  min_text_width_ratio: 0.05
+  static_sign_sec: 2.0    # 文本持续不变且超宽 -> 判为场景文字，不擦
+  static_sign_width_ratio: 0.40
+  white_level: 185        # 参考帧门控：白色字幕的通道下限
+  white_sat: 22           # 白色字幕允许的 R-B 色偏
+
+inpaint:
+  max_w: 1024             # 兼容用；实际由 fixed_w/fixed_h 决定
+  fixed_w: 1024           # 画布宽上限：fit_canvas 时按字幕带实际宽度收缩
+  fixed_h: 256            # 画布高上限：fit_canvas 时按字幕带实际高度收缩
+  fit_canvas: false       # 勿开：LaMa 的 FFT 全局分支对画布尺寸敏感，窄画布会让编织绳/流苏纹理明显变差
+  backend: native         # native=原生 PyTorch（conv fp16 + FFT fp32）| script=旧 TorchScript
+  batch: 8
+  fp16: true              # 仅 native 后端生效：卷积 autocast fp16，FFT 强制 fp32；实测 1.7×
+  device: cuda            # ROCm 下 torch 仍用 "cuda" 这个设备名
+  crop_margin: 24         # 掩码上下额外裁进来的上下文像素
+  color_match: false      # LaMa 输出本身偏暗，标准差再缩放会放大噪点（黑裙变灰块）
+  feather_sigma: 2.5
+  temporal_ema: 0.4       # 擦除区域时域平滑（0 关闭）；低运动直接平均，高运动走光流补偿
+
+qa:
+  residual_conf: 0.5      # 擦除后仍有框且置信度超过它 -> 失败
+  residual_samples: 5
+  flicker_ratio: 1.5
+  color_delta: 12
+
+worker:
+  # 镜头级流水：一路 prepare 里同时推进几个镜头（0=自动，1=老行为）。
+  # 单跑 4 路实测擦除 281s→94s、峰值约 6GB；批量由 batch_pipeline 按并发下调。
+  erase_pipe: 0
+  # 压制并发数（batch_pipeline 默认 3；1=老行为，压制与翻译串行）
+  burn_jobs: 3
+  max_attempts: 3
+  keep_segments: false    # 拼接后删除段落文件
+  night_mode: true        # 夜间批处理时禁用 AMD runpm 休眠
