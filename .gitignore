@@ -20,3 +20,6 @@ venv/
 *.log
 *.tmp
 .DS_Store
+
+# 基准产物（成片/缓存/采样）
+bench/probe/

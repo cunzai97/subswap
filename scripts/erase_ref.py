@@ -25,6 +25,75 @@ REF_FEATHER = 1.0
 MODEL_FEATHER = 2.5
 MODEL_STAB = 0.45
 
+# 第三档（ProPainter）默认参数：阈值沿用 bench/video_inpaint/HYBRID_ROUTING.md
+PP_TEX = 16.0          # 背景 Laplacian 方差中位数 >= 16 → 难
+PP_MOTION = 2.5        # 相邻帧灰度差中位数 >= 2.5 → 难
+PP_GUARD_MEAN = 20.0   # PP 与 LaMa 掩码内平均差 > 20 → 判 PP 幻觉，回退 LaMa
+PP_GUARD_P90 = 85.0    # 或 p90 > 85 → 回退
+PP_MAX_FRAMES = 900    # 单镜头最多送给 PP 的帧数（防止一镜到底的片子把耗时打爆）
+
+
+def tier_cfg(cfg):
+    """读 erase.tiers 配置；ERASE_TIERS=0/off 可全局关掉第三档。"""
+    import os
+    ecfg = cfg.get("erase") or {}
+    on = bool(ecfg.get("tiers", False))
+    env = os.environ.get("ERASE_TIERS", "").strip().lower()
+    if env in ("0", "off", "false", "no"):
+        on = False
+    elif env in ("1", "on", "true", "yes"):
+        on = True
+    def _env(name, dflt):
+        v = os.environ.get(name)
+        return float(v) if v not in (None, "") else dflt
+
+    return {
+        "on": on,
+        "tex": _env("VE_PP_TEX", float(ecfg.get("pp_tex", PP_TEX))),
+        "motion": _env("VE_PP_MOTION", float(ecfg.get("pp_motion", PP_MOTION))),
+        "guard_mean": float(ecfg.get("pp_guard_mean", PP_GUARD_MEAN)),
+        "guard_p90": float(ecfg.get("pp_guard_p90", PP_GUARD_P90)),
+        "max_frames": int(ecfg.get("pp_max_frames", PP_MAX_FRAMES)),
+        "frame_motion": float(ecfg.get("pp_frame_motion", PP_MOTION)),
+        "chunk": int(ecfg.get("pp_chunk", 80)),
+        "subvideo": int(ecfg.get("pp_subvideo", 80)),
+        "neighbor": int(ecfg.get("pp_neighbor", 10)),
+        "scale": float(ecfg.get("pp_scale", 1.0)),
+        "vpad": float(ecfg.get("pp_vpad", 0.8)),
+    }
+
+
+def _pp_rect(tracks, w, h, fh, vpad, clip=None):
+    """PP 只吃字幕带本身（不需要参考填充那么大的上下文），显存和耗时都省一半。"""
+    ub = [tr["ubox"] for tr in tracks if tr.get("ubox")]
+    if not ub:
+        return None
+    tx0 = min(b[0] for b in ub)
+    ty0 = min(b[1] for b in ub)
+    tx1 = max(b[2] for b in ub)
+    ty1 = max(b[3] for b in ub)
+    pad_y = max(24, int(round(vpad * fh)))
+    pad_x = max(24, int(round(0.25 * (tx1 - tx0) * 0.1)))
+    px0 = max(0, int(tx0) - pad_x) & ~1
+    py0 = max(0, int(ty0) - pad_y) & ~1
+    px1 = min(w, int(tx1) + pad_x + 1) & ~1
+    py1 = min(h, int(ty1) + pad_y + 1) & ~1
+    if clip is not None:
+        # 必须落在引擎已解码的 band crop 里，否则后面按坐标切片会错位
+        cx0, cy0, cx1, cy1 = clip
+        px0, py0 = max(px0, cx0), max(py0, cy0)
+        px1, py1 = min(px1, cx1), min(py1, cy1)
+    # PP 要求 8 的倍数（内部再裁一次，这里直接对齐，避免二次重采样）
+    px1 = px0 + ((px1 - px0) // 8) * 8
+    py1 = py0 + ((py1 - py0) // 8) * 8
+    if px1 - px0 < 64 or py1 - py0 < 32:
+        return None
+    return int(px0), int(py0), int(px1), int(py1)
+
+
+def _med(vals, default=0.0):
+    return float(np.median(vals)) if vals else default
+
 
 def _runs_of(ids):
     out = []
@@ -261,6 +330,60 @@ def _active_frames(tracks, n, fps, t0):
     return int(active.sum())
 
 
+def _pp_shot(P, fmm, mmm, todo, geo, pprect, tracks, shot, fps, tier, mcfg,
+             mask_mode, cues, log):
+    """对给定帧号跑 ProPainter。返回 {帧号: 裁片内擦除结果（BGR）}。
+
+    掩码 = max(白字笔画膨胀, 生产笔画掩码)，与 bench v6 兜底口径一致；
+    掩码外像素 PP 也不许改（pp_engine 只贴回掩码内）。
+    """
+    import os
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    try:
+        import pp_engine
+    except Exception as e:  # noqa: BLE001
+        log(f"    ProPainter 不可用（{type(e).__name__}: {e}），本镜头继续走 LaMa")
+        return {}
+    if not pp_engine.available():
+        log("    ProPainter 权重/仓库缺失，本镜头继续走 LaMa")
+        return {}
+    x0, y0, bw, bh = geo
+    px0, py0, px1, py1 = pprect
+    cw, ch, ox, oy = px1 - px0, py1 - py0, px0 - x0, py0 - y0
+    pad = int(mcfg.get("mask_pad", 8))
+    dilate = max(3, int(mcfg.get("dilate", 20)))
+    fallback = float(mcfg.get("stroke_fallback", 0.12))
+    expand = float(mcfg.get("expand_ratio", 0.0))
+    bright = float(mcfg.get("bright_fallback", 0.0))
+    kernel = np.ones((dilate, dilate), np.uint8)
+    frames, masks, keys = [], [], []
+    for k in todo:
+        t = shot["start"] + k / fps
+        crop = np.ascontiguousarray(fmm[k][oy:oy + ch, ox:ox + cw])
+        gm = cv2.dilate((mmm[k] > 0).astype(np.uint8) * 255, kernel)[oy:oy + ch, ox:ox + cw]
+        try:
+            mt = P.track_mask(crop, tracks, t, px0, py0, mask_mode, pad=pad,
+                              dilate=dilate, fallback=fallback, expand=expand,
+                              bright=bright)
+        except Exception:  # noqa: BLE001
+            mt = np.zeros((ch, cw), np.uint8)
+        m = (((gm > 0) | (mt > 0)).astype(np.uint8) * 255)
+        m = np.ascontiguousarray(
+            m & (_active_limit(P, ch, cw, tracks, t, px0, py0, pad, cues=cues) > 0))
+        if not m.any():
+            continue
+        frames.append(crop)
+        masks.append(m)
+        keys.append(k)
+    if not frames:
+        return {}
+    out = pp_engine.inpaint(frames, masks, log=log, chunk=tier["chunk"],
+                            subvideo=tier["subvideo"], neighbor=tier["neighbor"],
+                            scale=tier["scale"])
+    return dict(zip(keys, out))
+
+
 def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
                    mask_mode="stroke", dbg_name="shot", amp=False, cues=None):
     t_start = time.time()
@@ -269,7 +392,8 @@ def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
     n_exp = int(round(shot["end"] * fps)) - int(round(shot["start"] * fps))
     if n_exp <= 0:
         return 0, 0.0, 0.0, 0.0, "ref"
-    x0, y0, x1, y1 = P._band_rect(tracks, w, h)
+    bx0, by0, bx1, by1 = P._band_rect(tracks, w, h)
+    x0, y0, x1, y1 = bx0, by0, bx1, by1
     # 参考填充需要比字幕框更大的背景做光流和光度校验；v6 直接用了整幅宽度。
     cx = max(96, int(round(0.35 * (x1 - x0))))
     cy = max(32, int(round(0.25 * (y1 - y0))))
@@ -288,6 +412,7 @@ def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
     ref_feather = float(ecfg.get("ref_feather", REF_FEATHER))
     model_feather = float(ecfg.get("model_feather", MODEL_FEATHER))
     model_stab = float(ecfg.get("model_stab", MODEL_STAB))
+    tier = tier_cfg(cfg)
 
     boxes = [b for tr in tracks for _, b in tr["boxes"]]
     if not boxes:
@@ -324,6 +449,17 @@ def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
         mpath = f"{td}/masks.raw"
         present, n = [], 0
         merged_n = 0
+        tex_v, motion_v, prev_g = [], [], None
+        mot_k = np.zeros(n_exp, np.float32)
+        zone_mask = None
+        if tier["on"]:
+            zone_mask = np.zeros((bh, bw), bool)
+            za, zb = max(0, by0 - y0), min(bh, by1 - y0)
+            zc, zd = max(0, bx0 - x0), min(bw, bx1 - x0)
+            if zb > za and zd > zc:
+                zone_mask[za:zb, zc:zd] = True
+            else:
+                zone_mask = None
         kernel = np.ones((dilate, dilate), np.uint8)
         padt = pad + max(8, dilate // 2)
         with open(fpath, "wb") as fw, open(mpath, "wb") as mw:
@@ -374,6 +510,20 @@ def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
                                 m, _active_limit(P, bh, bw, tracks, t, x0, y0, pad,
                                              cues=cues))
                         present.append(k)
+                if tier["on"]:
+                    g = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY)
+                    bgm = (m == 0)
+                    if zone_mask is not None:
+                        bgm = bgm & zone_mask
+                    if bgm.any():
+                        tv = float(cv2.Laplacian(g, cv2.CV_32F)[bgm].var())
+                        tex_v.append(tv)
+                        if prev_g is not None:
+                            mv = float(cv2.absdiff(g, prev_g)[bgm].mean())
+                            motion_v.append(mv)
+                            if k < len(mot_k):
+                                mot_k[k] = mv
+                    prev_g = g
                 fw.write(fr.tobytes())
                 mw.write(m.tobytes())
                 n += 1
@@ -407,12 +557,63 @@ def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
         fmm = np.memmap(fpath, dtype=np.uint8, mode="r", shape=(n, bh, bw, 3))
         mmm = np.memmap(mpath, dtype=np.uint8, mode="r", shape=(n, bh, bw))
         dis = _make_dis()
+
+        # ---- 三级分流：一档参考帧填充（逐帧、真实像素）/ 二档 LaMa / 三档 ProPainter ----
+        # 分类按「镜头」做，不按帧：模型逐帧切换会让纹理在帧间跳变，比字幕更显眼。
+        pp_bands, pp_rect, pp_why = {}, None, ""
+        tex_med, mot_med = _med(tex_v), _med(motion_v)
+        if tier["on"]:
+            why = []
+            # 阈值 <= 0 表示该判据不启用：生产带上纹理值天然很高（脸/衣服/铁网），
+            # bench 那套 16/2.5 的绝对阈值搬过来会把九成镜头判成「难」。
+            if tier["tex"] > 0 and tex_med >= tier["tex"]:
+                why.append(f"纹理 {tex_med:.1f}≥{tier['tex']:g}")
+            if tier["motion"] > 0 and mot_med >= tier["motion"]:
+                why.append(f"运动 {mot_med:.1f}≥{tier['motion']:g}")
+            if not cleans:
+                why.append("本段无干净参考帧")
+            todo = []
+            if why:
+                pp_rect = _pp_rect(tracks, w, h, fh, tier["vpad"],
+                                   clip=(x0, y0, x1, y1))
+                # 只把这些必进模型的帧送 PP：本段没有干净参考帧，或本帧背景运动大
+                # （参考帧 warp 会错位）。无字帧不需要任何模型。
+                need = [k for k in present
+                        if k < n and (run_ref.get(
+                            (runs[run_of[k]][0], runs[run_of[k]][-1])) is None
+                            or (k < len(mot_k) and tier["frame_motion"] > 0
+                                and mot_k[k] >= tier["frame_motion"]))]
+                budget = tier["max_frames"]
+                if len(need) >= 3 and pp_rect is not None:
+                    for run in _runs_of(need):
+                        a, b = max(0, run[0] - 2), min(n - 1, run[-1] + 2)
+                        if b - a + 1 > budget:
+                            b = a + budget - 1
+                        todo.extend(range(a, b + 1))
+                        budget -= (b - a + 1)
+                        if budget <= 0:
+                            break
+            if why and todo and pp_rect is not None:
+                pp_why = "+".join(why)
+                P.log(f"    三级分流：{pp_why} → ProPainter（裁片 "
+                      f"{pp_rect[2]-pp_rect[0]}x{pp_rect[3]-pp_rect[1]}，"
+                      f"{len(todo)}/{sum(len(r) for r in runs)} 帧）")
+                pp_bands = _pp_shot(P, fmm, mmm, todo, (x0, y0, bw, bh), pp_rect,
+                                    tracks, shot, fps, tier, mcfg, mask_mode,
+                                    cues, P.log)
+                if not pp_bands:
+                    pp_why, pp_rect = "", None
+            else:
+                extra = "（参考帧能覆盖，不需要 PP）" if why else ""
+                P.log(f"    三级分流：纹理 {tex_med:.1f} 运动 {mot_med:.1f}"
+                      f"{extra} → LaMa")
+        pp_st = {"ok": 0, "rej": 0}
         stab_state = {"prev": None, "gray": None}
         batch_size = max(1, int(cfg["inpaint"].get("batch", 8)))
         ref_n = model_n = raw_n = no_ref = photo_fail = masked_px = 0
         total = 0
         last_bytes = None
-        buf, bands, model_masks = [], [], []
+        buf, bands, model_masks, bidx = [], [], [], []
 
         def flush():
             nonlocal total, last_bytes
@@ -425,6 +626,28 @@ def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
                                     model_feather)
                 for i, b in zip(idx, filled):
                     bands[i] = b
+                # 三档仲裁：PP 结果只在掩码内生效；和 LaMa 差太多说明 PP 在幻觉，
+                # 退回 LaMa（bench 的安全闸口径）
+                if pp_bands:
+                    ox, oy = pp_rect[0] - x0, pp_rect[1] - y0
+                    cw, ch = pp_rect[2] - pp_rect[0], pp_rect[3] - pp_rect[1]
+                    for i in idx:
+                        pr = pp_bands.get(bidx[i])
+                        if pr is None:
+                            continue
+                        ppb = bands[i].copy()
+                        ppb[oy:oy + ch, ox:ox + cw] = pr
+                        mm = model_masks[i]
+                        if not mm.any():
+                            continue
+                        d = np.abs(ppb.astype(np.int16)
+                                   - bands[i].astype(np.int16)).mean(axis=2)[mm]
+                        if (d.mean() <= tier["guard_mean"]
+                                and np.percentile(d, 90) <= tier["guard_p90"]):
+                            bands[i] = ppb
+                            pp_st["ok"] += 1
+                        else:
+                            pp_st["rej"] += 1
             has_model = any(m is not None for m in model_masks)
             if has_model:
                 P.temporal_stabilize(
@@ -447,6 +670,7 @@ def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
             buf.clear()
             bands.clear()
             model_masks.clear()
+            bidx.clear()
 
         for k, fr in enumerate(P.iter_frames(path, w, h, shot["start"], dur, None)):
             if k >= n_exp:
@@ -508,6 +732,7 @@ def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
             buf.append(fr)
             bands.append(band)
             model_masks.append(mt)
+            bidx.append(k)
             if len(buf) >= batch_size:
                 flush()
         flush()
@@ -518,7 +743,10 @@ def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
 
     dt = time.time() - t_start
     coverage = masked_px / max(total * bh * bw, 1)
+    pp_txt = ""
+    if pp_st["ok"] or pp_st["rej"]:
+        pp_txt = f"  PP {pp_st['ok']}（回退 {pp_st['rej']}）"
     P.log(f"    ref {ref_n} / model {model_n}（无参考 {no_ref}，光度 {photo_fail}）"
-          f" / 原样 {raw_n}  掩码 {coverage*100:.1f}%  "
+          f" / 原样 {raw_n}{pp_txt}  掩码 {coverage*100:.1f}%  "
           f"{total} 帧 {dt:.1f}s ({total/dt if dt else 0:.1f} fps)")
     return total, dt, (total / dt if dt else 0.0), coverage, "ref"

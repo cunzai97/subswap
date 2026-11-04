@@ -21,6 +21,19 @@ erase:
   ref_feather: 1.0        # 参考填充羽化（真实像素，收紧）
   model_feather: 2.5      # 模型兜底羽化（放宽，压接缝）
   model_stab: 0.45        # 只对模型兜底帧做时域稳定
+  # ---- 三级分流：一档参考帧（真实像素）→ 二档 LaMa → 三档 ProPainter（最难）----
+  tiers: false            # 开关；开了只影响「参考帧填不了的帧」，代价见 docs/ERASE_TIERS_2026-11-04.md
+  pp_tex: 0               # 镜头纹理中位数 ≥ 此值才考虑 PP（0=不启用该判据，生产带纹理天然偏高）
+  pp_motion: 0            # 镜头运动中位数 ≥ 此值才考虑 PP（0=不启用）
+  pp_frame_motion: 2.5    # 逐帧：本帧背景运动 ≥ 此值 → 送 PP（参考帧 warp 会错位）
+  pp_guard_mean: 20.0     # PP 与 LaMa 掩码内平均差 > 此值 → 判 PP 幻觉，回退 LaMa
+  pp_guard_p90: 85.0      # 或 p90 > 此值 → 回退
+  pp_max_frames: 900      # 单镜头最多送 PP 的帧数
+  pp_chunk: 80            # PP 单次处理帧数（显存随帧数线性涨）
+  pp_subvideo: 80         # PP 官方 subvideo_length
+  pp_neighbor: 10         # PP 官方 neighbor_length
+  pp_scale: 1.0           # <1 时 PP 降分辨率跑（省显存和时间，细节会掉）
+  pp_vpad: 0.8            # PP 裁片上下留白 = 0.8 × 字高
   auto_repair: true       # 本地擦除后自动 OCR 复查，只返修有残留的镜头
   repair_rounds: 2        # 最多返修轮数（每轮全片复查一次）
   cloud:
