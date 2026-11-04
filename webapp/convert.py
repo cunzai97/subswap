@@ -638,7 +638,7 @@ def erase(src: Path, meta, layout, shots, per_shot, cfg, on_prog, log,
     # 只喂字幕带的中间层：ffmpeg 自己解码源片、把带贴回去再编码。
     # 省掉 Python 侧每帧 6.2MB 的整帧搬运（实测见 docs/ERASE_WRITE_OVERLAY.md）。
     write_mode = (os.environ.get("ERASE_WRITE")
-                  or ((cfg or {}).get("worker") or {}).get("erase_write") or "full")
+                  or ((cfg or {}).get("worker") or {}).get("erase_write") or "overlay")
     overlay_ok = (str(write_mode).lower() == "overlay"
                   and str(((cfg or {}).get("erase") or {}).get("engine", "ref")) != "legacy")
 

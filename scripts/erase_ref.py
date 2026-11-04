@@ -583,6 +583,10 @@ def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
     stab_mode = os.environ.get("VE_STAB_MODE") or ecfg.get("stab_mode", "blend")
     stab_radius = int(os.environ.get("VE_STAB_RADIUS")
                       or ecfg.get("stab_radius", 1))
+    stab_refresh = int(os.environ.get("VE_STAB_REFRESH")
+                       or ecfg.get("stab_refresh", 0))
+    stab_floor = float(os.environ.get("VE_STAB_FLOOR")
+                       or ecfg.get("stab_floor", 0.4))
     tf_radius = int(os.environ.get("VE_TF_RADIUS")
                     or ecfg.get("tf_radius", 2))
     tf_thr = float(os.environ.get("VE_TF_THR") or ecfg.get("tf_thr", 18.0))
@@ -786,6 +790,15 @@ def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
                       f"{extra} → LaMa")
         pp_st = {"ok": 0, "rej": 0}
         stab_state = {"prev": None, "gray": None}
+        # 平滑用的区域：整条字幕带里所有 cue 框的并集（再并上模型掩码）。
+        # 只平滑模型帧的话，参考帧回填/TF 出来的像素照样会逐帧抖。
+        stab_zone = np.zeros((bh, bw), np.uint8)
+        for _tr in tracks:
+            _b = _tr.get("ubox") or _tr.get("last_box")
+            stab_zone[max(0, int(_b[1]) - y0):min(bh, int(_b[3]) - y0),
+                      max(0, int(_b[0]) - x0):min(bw, int(_b[2]) - x0)] = 255
+        if not stab_zone.any():
+            stab_zone = None
         batch_size = max(1, int(cfg["inpaint"].get("batch", 8)))
         ref_n = model_n = raw_n = no_ref = photo_fail = masked_px = 0
         tf_px = 0
@@ -832,12 +845,17 @@ def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
                 bands[:] = P.temporal_median(bands, raws, model_masks, stab_state,
                                              radius=int(stab_radius),
                                              thr=stab_thr, use_flow=True)
-            elif has_model:
+            elif model_stab > 0 and stab_zone is not None:
+                _masks = []
+                for m in model_masks:
+                    if m is None:
+                        _masks.append(stab_zone)
+                    else:
+                        _masks.append(cv2.bitwise_or(
+                            m.astype(np.uint8) * 255, stab_zone))
                 P.temporal_stabilize(
-                    bands,
-                    [(m.astype(np.uint8) * 255 if m is not None
-                      else np.zeros((bh, bw), np.uint8)) for m in model_masks],
-                    stab_state, model_stab, use_flow=True, thr=stab_thr)
+                    bands, _masks, stab_state, model_stab, use_flow=True,
+                    thr=stab_thr, refresh=stab_refresh, floor=stab_floor)
             elif model_stab > 0:
                 # 没有模型帧的批次也要把状态推到最后一帧，
                 # 否则下一段模型帧会从几批之前的旧帧做光流，稳定性失真。

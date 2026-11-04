@@ -746,7 +746,8 @@ def temporal_median(frames, raws, masks, state, radius=1, thr=18.0,
     return out
 
 
-def temporal_stabilize(frames, masks, state, alpha=0.4, use_flow=True, thr=0.0):
+def temporal_stabilize(frames, masks, state, alpha=0.4, use_flow=True, thr=0.0,
+                       refresh=0, floor=0.4):
     """运动补偿的时域平滑：只混合掩码内像素，压掉逐帧重绘的纹理跳动。
     state 跨帧保存上一帧结果；看不清/切镜时自动放弃混合（避免拖影）。
     低运动镜头直接混合（光流误差常常比待平滑的抖动还大）"""
@@ -778,7 +779,7 @@ def temporal_stabilize(frames, masks, state, alpha=0.4, use_flow=True, thr=0.0):
                                cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
         else:
             warped = prev
-        region = cv2.dilate(mk, np.ones((21, 21), np.uint8))
+        region = cv2.dilate(mk, np.ones((25, 25), np.uint8))
         a0 = alpha
         outside = region == 0
         if outside.any():
@@ -815,7 +816,16 @@ def temporal_stabilize(frames, masks, state, alpha=0.4, use_flow=True, thr=0.0):
                     # 背景一致率的大范围均值当可信度：掩码内部本来就没有背景可比，
                     # 用周围一圈的平均代替。原来用 TELEA 外推，单帧 162ms，太贵。
                     conf = cv2.blur(good, (81, 81))
-                    amap = amap * np.clip(conf * 1.6, 0.0, 1.0)
+                    # 保底 0.4：运动大的镜头里背景几乎每一帧都对不齐（conf→0），
+                    # 而抖动最凶的恰恰就是这些镜头——把可信度当乘法直接乘下去，
+                    # 等于在最需要平滑的地方一点不平滑。只用它往下压，不归零。
+                    amap = amap * np.clip(floor + 1.2 * conf, 0.0, 1.0)
+                if refresh > 0:
+                    # 定期用本帧的合成结果重置历史：alpha 拉高到近乎全历史时，
+                    # 光流的小误差会一直累积成拖影，隔几帧重来一次把它清掉。
+                    state["age"] = state.get("age", 0) + 1
+                    if state["age"] % refresh == 0:
+                        amap = amap * 0.0
                 a = amap[..., None]
                 sub = fr[ry0:ry1, rx0:rx1].astype(np.float32)
                 wsub = warped[ry0:ry1, rx0:rx1].astype(np.float32)
