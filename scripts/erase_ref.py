@@ -421,12 +421,15 @@ def _warp_band(dis, band_j, band_i, mk_j, cache=None):
                          np.arange(h, dtype=np.float32))
     wr = cv2.remap(band_j, gx + fl[..., 0], gy + fl[..., 1],
                    cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-    if mk_j is not None and mk_j.any():
-        mj = cv2.dilate(mk_j.astype(np.uint8), np.ones((9, 9), np.uint8))
-        valid = cv2.remap(mj, gx + fl[..., 0], gy + fl[..., 1],
-                          cv2.INTER_NEAREST, borderMode=cv2.BORDER_REPLICATE) == 0
-    else:
-        valid = np.ones((h, w), bool)
+    if mk_j is None or not mk_j.any():
+        # 这一帧没检到字：可能是真没字幕，也可能是漏检。分不清就不能拿它当
+        # 真实像素来源——漏检时整帧所有像素都会被判成「有效」，字和阴影就
+        # 原样被抄进当前帧（实测这就是白布料镜头残留「影子字」的来源）。
+        return None, None
+    # 膨胀要盖住字周围的描边/阴影：只膨胀 9px 时邻居的阴影仍被当成背景抄过来
+    mj = cv2.dilate(mk_j.astype(np.uint8), np.ones((23, 23), np.uint8))
+    valid = cv2.remap(mj, gx + fl[..., 0], gy + fl[..., 1],
+                      cv2.INTER_NEAREST, borderMode=cv2.BORDER_REPLICATE) == 0
     return wr, valid
 
 
@@ -459,6 +462,11 @@ def _temporal_fill(P, band, k, fmm, mmm, mt, dis, flow_cache, radius, thr, log_c
             if j < 0 or j >= len(mmm):
                 continue
             key = (k, j)
+            # 邻居这一帧的掩码明显小于当前帧（漏检了多半行）时，它上面全是
+            # 「没被盖住」的字，抄过来就是把下一句的字搬进这一帧。
+            _nj = int((np.asarray(mmm[j]) > 0).sum())
+            if _nj < 0.35 * int((mt > 0).sum()):
+                continue
             wj, vj = flow_cache.get(key, (None, None))
             if wj is None:
                 mkj = (mmm[j] > 0).astype(np.uint8) * 255
@@ -652,6 +660,7 @@ def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
         mpath = f"{td}/masks.raw"
         present, n = [], 0
         merged_n = 0
+        merged_frames = {}
         tex_v, motion_v, prev_g = [], [], None
         mot_k = np.zeros(n_exp, np.float32)
         zone_mask = None
@@ -708,15 +717,24 @@ def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
                                             hit_cap = True
                             if hit_cap:
                                 merged_n += 1
+                        _gb = None
+                        if kbox is not None:
+                            _gb = (kbox[0] + x0, kbox[1] + y0,
+                                   kbox[2] + x0, kbox[3] + y0)
+                        _lim = _active_limit(P, bh, bw, tracks, t, x0, y0, pad,
+                                             cues=cues, span=lim_span, gbox=_gb)
+                        if merged:
+                            # 白字和白衣服/白墙粘成一整块：字形检测这时不可信，
+                            # 只有左半边被检出来、右半边留在原处（实测残留最多的
+                            # 就是这种「白底白字」镜头）。这一帧整行按字幕轨的
+                            # 行框当矩形处理（用 cue 并集会一路扩到整条带子）。
+                            m = P.track_mask(fr, tracks, t, x0, y0, "rect",
+                                             pad=pad, dilate=0)
+                            merged_n += 1
+                        elif m.any():
+                            m = cv2.bitwise_and(m, _lim)
                         if m.any():
-                            _gb = None
-                            if kbox is not None:
-                                _gb = (kbox[0] + x0, kbox[1] + y0,
-                                       kbox[2] + x0, kbox[3] + y0)
-                            m = cv2.bitwise_and(
-                                m, _active_limit(P, bh, bw, tracks, t, x0, y0, pad,
-                                                 cues=cues, span=lim_span,
-                                                 gbox=_gb))
+                            merged_frames[k] = 1 if merged else 0
                         present.append(k)
                 if tier["on"]:
                     g = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY)
@@ -959,6 +977,12 @@ def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
                                       fallback=fallback, expand=expand,
                                       bright=bright)
                     mt = (mt > 0) | mref
+                    if merged_frames.get(k):
+                        _rr = P.track_mask(band, tracks, shot["start"] + k / fps,
+                                           x0, y0, "rect", pad=pad, dilate=0)
+                        if (_rr > 0).any():
+                            mt = _rr > 0
+                            mref = mt
                     _gb2 = None
                     if mref.any():
                         _ys, _xs = np.where(mref)
