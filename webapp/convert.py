@@ -649,9 +649,11 @@ def erase(src: Path, meta, layout, shots, per_shot, cfg, on_prog, log,
         band = P.erase_band_rect(tracks, meta["w"], meta["h"]) \
             if (overlay_ok and tracks) else None
         if band is not None:
+            n_shot = int(round(shot["end"] * meta["fps"])) \
+                - int(round(shot["start"] * meta["fps"]))
             writer = P.open_overlay_writer(str(segs[i]), src, meta, shot["start"],
                                            shot["end"] - shot["start"], band,
-                                           force_x264=force_x264)
+                                           force_x264=force_x264, frames=n_shot)
         else:
             writer = P.open_writer(str(segs[i]), meta["w"], meta["h"], meta["fps"],
                                    force_x264=force_x264)

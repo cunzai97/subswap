@@ -509,7 +509,8 @@ def erase_band_rect(tracks, w, h):
             min(w, x1 + cx) & ~1, min(h, y1 + cy) & ~1)
 
 
-def open_overlay_writer(path, src, meta, start, dur, band_rect, force_x264=False):
+def open_overlay_writer(path, src, meta, start, dur, band_rect, force_x264=False,
+                        frames=0):
     """只喂「字幕带」的中间层写入器。
 
     原路径：Python 每帧搬整帧（1080x1920x3 = 6.2MB）给 ffmpeg 编码。
@@ -525,8 +526,13 @@ def open_overlay_writer(path, src, meta, start, dur, band_rect, force_x264=False
            "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{bw}x{bh}",
            "-r", f"{meta['fps']:g}", "-i", "-", "-an",
            "-filter_complex",
-           f"[0:v]crop={bw}:{bh}:{bx0}:{by0}[base];[base][1:v]overlay=0:0:format=yuv420[v]",
-           "-map", "[v]"]
+           # 底是整帧（不能先 crop：crop 完再 overlay 出来的是带子本身）
+           f"[0:v][1:v]overlay={bx0}:{by0}:format=yuv420[v]",
+           "-map", "[v]", "-fps_mode", "cfr", "-r", f"{meta['fps']:g}"]
+    if frames > 0:
+        # 帧数由 Python 侧按镜头网格算好，这里硬锁：靠 -t 让 ffmpeg 自己收尾会
+        # 每个镜头多出几帧，49 个镜头攒下来整片就漂了（实测 +205 帧）。
+        cmd += ["-frames:v", str(int(frames))]
     if not force_x264 and os.environ.get("ERASE_WRITER", "auto").lower() != "x264" \
             and nvenc_ok():
         cq = os.environ.get("ERASE_NVENC_CQ", "14")
@@ -747,7 +753,7 @@ def temporal_median(frames, raws, masks, state, radius=1, thr=18.0,
 
 
 def temporal_stabilize(frames, masks, state, alpha=0.4, use_flow=True, thr=0.0,
-                       refresh=0, floor=0.4):
+                       refresh=0, floor=0.4, jump=0.0):
     """运动补偿的时域平滑：只混合掩码内像素，压掉逐帧重绘的纹理跳动。
     state 跨帧保存上一帧结果；看不清/切镜时自动放弃混合（避免拖影）。
     低运动镜头直接混合（光流误差常常比待平滑的抖动还大）"""
@@ -820,6 +826,14 @@ def temporal_stabilize(frames, masks, state, alpha=0.4, use_flow=True, thr=0.0,
                     # 而抖动最凶的恰恰就是这些镜头——把可信度当乘法直接乘下去，
                     # 等于在最需要平滑的地方一点不平滑。只用它往下压，不归零。
                     amap = amap * np.clip(floor + 1.2 * conf, 0.0, 1.0)
+                # 万一掩码里还剩东西（描边/漏检字），高比例混历史会把它拖成横向拖影。
+                # 掩码内这一帧和上一帧差得太远就当「内容真的换了」，本帧不做混合。
+                if jump > 0 and (region > 0).any():
+                    dd_in = np.abs(
+                        warped[region > 0].astype(np.int16)
+                        - fr[region > 0].astype(np.int16)).mean()
+                    if dd_in > jump:
+                        amap = amap * 0.0
                 if refresh > 0:
                     # 定期用本帧的合成结果重置历史：alpha 拉高到近乎全历史时，
                     # 光流的小误差会一直累积成拖影，隔几帧重来一次把它清掉。
@@ -1088,11 +1102,18 @@ def erase_shot_legacy(model, path, shot, tracks, meta, writer, cfg, mask_mode="s
                                use_flow=motion > 1.2)
         _prof("stab", time.perf_counter() - t_s)
 
+        br = getattr(writer, "band_rect", None)
         for i in range(n_real):
             frames[i][y0:y1, x0:x1] = real_bands[i]
             if total >= n_exp:
                 continue
-            last_bytes = frames[i].tobytes()
+            if br is not None:
+                # overlay 写入器只要字幕带：整帧喂进去尺寸对不上，ffmpeg 直接退出
+                bx0, by0, bx1, by1 = br
+                last_bytes = np.ascontiguousarray(
+                    frames[i][by0:by1, bx0:bx1]).tobytes()
+            else:
+                last_bytes = frames[i].tobytes()
             writer.stdin.write(last_bytes)
             total += 1
 

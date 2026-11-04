@@ -217,11 +217,16 @@ def _glyph_mask(frame, zone, params):
     return keep, total, merged, bbox
 
 
-def _active_limit(P, h, w, tracks, t, x0, y0, pad, cues=None):
+def _active_limit(P, h, w, tracks, t, x0, y0, pad, cues=None, span=0.08, gbox=None):
     """当前时刻活跃字幕的 OCR 行框（局部坐标，外扩 pad）。
 
     优先用 merge 后的 cue 行框：原始 tracks 的口型时间更宽，会把下一条
     cue 的框（甚至白衣服/徽章）并进来，导致整条横向被抹平。
+
+    span：时间窗。cue 的时间和画面里字出现的时间常有半拍错位（上一句还没结束、
+    下一句已经在淡入），窗口太窄时 t 时刻取到的是**上一句**的小框，交集之后
+    新出现的那半行根本不在掩码里——成片里就是「半边字留着」。
+    所以取前后 span 秒内所有 cue 行框的并集，横向仍按这些行框收窄。
     """
     lim = np.zeros((h, w), np.uint8)
 
@@ -236,13 +241,27 @@ def _active_limit(P, h, w, tracks, t, x0, y0, pad, cues=None):
             lim[by0:by1, bx0:bx1] = 255
 
     if cues:
+        # 单靠时间选 cue 会选错：画面里新一句常常比 cue 的 start 早半拍淡入，
+        # 这时按时间拿到的还是上一句的小框，交集之后新出现的那半行留着不擦。
+        # 所以先用这一帧实际检测到的字形框去匹配 cue（横向重叠过半即认定），
+        # 匹配不上再退回按时间取。
+        if gbox is not None:
+            gx0, gx1 = int(gbox[0]), int(gbox[2])
+            gw = max(1, gx1 - gx0)
+            for c in cues:
+                b = c.get("box")
+                if not b:
+                    continue
+                ov = min(gx1, int(b[2])) - max(gx0, int(b[0]))
+                if ov >= 0.5 * gw:
+                    add_box(b)
         for c in cues:
-            if c.get("box") and c["start"] - 0.08 <= t <= c["end"] + 0.08:
+            if c.get("box") and c["start"] - span <= t <= c["end"] + span:
                 add_box(c["box"])
         if lim.any():
             return lim
     for tr in tracks:
-        if not (tr["start"] - 0.08 <= t <= tr["end"] + 0.08):
+        if not (tr["start"] - max(span, 0.08) <= t <= tr["end"] + max(span, 0.08)):
             continue
         add_box(tr.get("ubox") or P._box_at(tr, t))
     return lim
@@ -587,6 +606,10 @@ def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
                        or ecfg.get("stab_refresh", 0))
     stab_floor = float(os.environ.get("VE_STAB_FLOOR")
                        or ecfg.get("stab_floor", 0.4))
+    lim_span = float(os.environ.get("VE_LIMIT_SPAN")
+                     or ecfg.get("limit_span", 0.08))
+    stab_jump = float(os.environ.get("VE_STAB_JUMP")
+                      or ecfg.get("stab_jump", 60.0))
     tf_radius = int(os.environ.get("VE_TF_RADIUS")
                     or ecfg.get("tf_radius", 2))
     tf_thr = float(os.environ.get("VE_TF_THR") or ecfg.get("tf_thr", 18.0))
@@ -686,9 +709,14 @@ def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
                             if hit_cap:
                                 merged_n += 1
                         if m.any():
+                            _gb = None
+                            if kbox is not None:
+                                _gb = (kbox[0] + x0, kbox[1] + y0,
+                                       kbox[2] + x0, kbox[3] + y0)
                             m = cv2.bitwise_and(
                                 m, _active_limit(P, bh, bw, tracks, t, x0, y0, pad,
-                                             cues=cues))
+                                                 cues=cues, span=lim_span,
+                                                 gbox=_gb))
                         present.append(k)
                 if tier["on"]:
                     g = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY)
@@ -855,7 +883,8 @@ def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
                             m.astype(np.uint8) * 255, stab_zone))
                 P.temporal_stabilize(
                     bands, _masks, stab_state, model_stab, use_flow=True,
-                    thr=stab_thr, refresh=stab_refresh, floor=stab_floor)
+                    thr=stab_thr, refresh=stab_refresh, floor=stab_floor,
+                    jump=stab_jump)
             elif model_stab > 0:
                 # 没有模型帧的批次也要把状态推到最后一帧，
                 # 否则下一段模型帧会从几批之前的旧帧做光流，稳定性失真。
@@ -898,7 +927,7 @@ def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
                     mfill = mref | (near & whiteish)
                     mfill = mfill & (_active_limit(
                         P, bh, bw, tracks, shot["start"] + k / fps,
-                        x0, y0, pad, cues=cues) > 0)
+                        x0, y0, pad, cues=cues, span=lim_span) > 0)
                     fl, sw, sh = _flow_to(band, fmm[r], dis)
                     md = cv2.dilate(mfill.astype(np.uint8),
                                     np.ones((31, 31), np.uint8))
@@ -930,9 +959,14 @@ def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
                                       fallback=fallback, expand=expand,
                                       bright=bright)
                     mt = (mt > 0) | mref
+                    _gb2 = None
+                    if mref.any():
+                        _ys, _xs = np.where(mref)
+                        _gb2 = (int(_xs.min()) + x0, int(_ys.min()) + y0,
+                                int(_xs.max()) + x0, int(_ys.max()) + y0)
                     mt = mt & (_active_limit(
                         P, bh, bw, tracks, shot["start"] + k / fps,
-                        x0, y0, pad, cues=cues) > 0)
+                        x0, y0, pad, cues=cues, span=lim_span, gbox=_gb2) > 0)
                     if tf_radius > 0 and mt.any():
                         # 先用相邻帧的真实像素把字幕区补掉（时间维补洞），
                         # 补不掉的洞才交给 LaMa——这块是真纹理，不糊也不抖。
