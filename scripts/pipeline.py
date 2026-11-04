@@ -497,6 +497,53 @@ def open_writer(path, w, h, fps, force_x264=False):
     return subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
 
+def erase_band_rect(tracks, w, h):
+    """擦除引擎实际处理的字幕带（原字幕带 + 参考填充要的上下文）。
+
+    erase_ref 和 overlay 写入器必须用同一个矩形，否则叠回去会错位。
+    """
+    x0, y0, x1, y1 = _band_rect(tracks, w, h)
+    cx = max(96, int(round(0.35 * (x1 - x0))))
+    cy = max(32, int(round(0.25 * (y1 - y0))))
+    return (max(0, x0 - cx) & ~1, max(0, y0 - cy) & ~1,
+            min(w, x1 + cx) & ~1, min(h, y1 + cy) & ~1)
+
+
+def open_overlay_writer(path, src, meta, start, dur, band_rect, force_x264=False):
+    """只喂「字幕带」的中间层写入器。
+
+    原路径：Python 每帧搬整帧（1080x1920x3 = 6.2MB）给 ffmpeg 编码。
+    这条路：ffmpeg 自己把源片解出来，把我们这条字幕带 patch 叠回去再编码，
+    Python 侧每帧只搬 1MB 左右，整帧解码/编码全留在 ffmpeg 里。
+
+    返回的 Popen 上挂了 band_rect 属性，擦除引擎据此只写带内像素。
+    """
+    bx0, by0, bx1, by1 = band_rect
+    bw, bh = bx1 - bx0, by1 - by0
+    cmd = ["ffmpeg", "-v", "error", "-y",
+           "-ss", f"{start:.6f}", "-t", f"{dur:.6f}", "-i", str(src),
+           "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{bw}x{bh}",
+           "-r", f"{meta['fps']:g}", "-i", "-", "-an",
+           "-filter_complex",
+           f"[0:v]crop={bw}:{bh}:{bx0}:{by0}[base];[base][1:v]overlay=0:0:format=yuv420[v]",
+           "-map", "[v]"]
+    if not force_x264 and os.environ.get("ERASE_WRITER", "auto").lower() != "x264" \
+            and nvenc_ok():
+        cq = os.environ.get("ERASE_NVENC_CQ", "14")
+        cmd += ["-c:v", "h264_nvenc", "-preset", "p5", "-cq", str(cq), "-b:v", "0"]
+    else:
+        cmd += ["-c:v", "libx264", "-crf", "14", "-preset", "veryfast"]
+        x264_threads = os.environ.get("ERASE_X264_THREADS")
+        if x264_threads:
+            cmd += ["-threads", str(max(1, int(x264_threads)))]
+    if str(path).endswith(".h264"):
+        cmd += ["-bf", "0"]
+    cmd += ["-pix_fmt", "yuv420p", str(path)]
+    w = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    w.band_rect = (bx0, by0, bx1, by1)
+    return w
+
+
 def match_color(src, dst, mask):
     ring = (cv2.dilate(mask, np.ones((11, 11), np.uint8)) > 0) & (mask == 0)
     hole = mask > 0
@@ -618,7 +665,88 @@ def track_mask(band, tracks, t, xo, yo, mask_mode="stroke", pad=8, dilate=7,
     return m
 
 
-def temporal_stabilize(frames, masks, state, alpha=0.4, use_flow=True):
+def temporal_median(frames, raws, masks, state, radius=1, thr=18.0,
+                    use_flow=True):
+    """运动补偿的时域中值：只在掩码内做，压掉逐帧重绘的随机纹理。
+
+    和「混合上一帧结果」的区别：这里每个候选都是**当帧重新生成的**填充，
+    中值只挑掉离谱的，不会把上一次模糊过的结果再 warp 一遍——混合法反复
+    构图会越抹越糊（实测把红印花抹平成一条亮带），中值不会。
+
+    state 跨批保存上一批的最后一帧，批边界也能取到左邻。
+    """
+    if not frames or radius <= 0:
+        return frames
+    dis = state.get("dis")
+    if use_flow and dis is None:
+        dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
+        state["dis"] = dis
+    h, w = frames[0].shape[:2]
+
+    def gray_flat(band, mask):
+        g = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
+        if mask is not None and mask.any():
+            g = cv2.inpaint(g, cv2.dilate(mask, np.ones((15, 15), np.uint8)), 5,
+                            cv2.INPAINT_TELEA)
+        return g
+
+    def flow_map(cur_g, ref_g):
+        """返回把 ref 对齐到 cur 的 remap 坐标增量。"""
+        s = min(1.0, 1080.0 / max(h, w))
+        sw, sh = max(16, int(round(w * s))), max(16, int(round(h * s)))
+        a = cv2.resize(ref_g, (sw, sh), interpolation=cv2.INTER_AREA)
+        b = cv2.resize(cur_g, (sw, sh), interpolation=cv2.INTER_AREA)
+        fl = dis.calc(b, a, None)
+        if (sw, sh) != (w, h):
+            fl = cv2.resize(fl, (w, h), interpolation=cv2.INTER_LINEAR) / s
+        return fl
+
+    items = list(zip(frames, raws, masks))
+    prev = state.get("prev_item")
+    gcache = {}
+    for i, (_, raw, _m) in enumerate(items):
+        gcache[i] = gray_flat(raw, None)
+    gcache[-1] = state.get("prev_gray")
+    out = []
+    for i, (band, raw, mk) in enumerate(items):
+        if mk is None or not mk.any():
+            out.append(band)
+            continue
+        cands = [band]
+        for d in (-radius, radius):
+            j = i + d
+            nj = items[j][0] if 0 <= j < len(items) else (
+                prev[0] if (j < 0 and prev is not None) else None)
+            if nj is None:
+                continue
+            gj = gcache.get(j)
+            if gj is None and not (0 <= j < len(items)):
+                gj = gcache.get(-1)
+            if gj is None:
+                continue
+            fl = flow_map(gcache[i], gj)
+            gx, gy = np.meshgrid(np.arange(w, dtype=np.float32),
+                                 np.arange(h, dtype=np.float32))
+            wr = cv2.remap(nj, gx + fl[..., 0], gy + fl[..., 1],
+                           cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+            # 只信和当前帧对得上的候选（差值超阈值说明对齐失败）
+            diff = np.abs(wr.astype(np.int16) - band.astype(np.int16)).mean(axis=2)
+            wr = np.where((diff < thr)[..., None], wr, band)
+            cands.append(wr)
+        if len(cands) > 1:
+            stack = np.stack(cands)
+            med = np.median(stack, axis=0).astype(np.uint8)
+            r = band.copy()
+            r[mk > 0] = med[mk > 0]
+            out.append(r)
+        else:
+            out.append(band)
+    state["prev_item"] = (frames[-1].copy(), raws[-1].copy(), masks[-1])
+    state["prev_gray"] = gray_flat(raws[-1], None)
+    return out
+
+
+def temporal_stabilize(frames, masks, state, alpha=0.4, use_flow=True, thr=0.0):
     """运动补偿的时域平滑：只混合掩码内像素，压掉逐帧重绘的纹理跳动。
     state 跨帧保存上一帧结果；看不清/切镜时自动放弃混合（避免拖影）。
     低运动镜头直接混合（光流误差常常比待平滑的抖动还大）"""
@@ -637,7 +765,7 @@ def temporal_stabilize(frames, masks, state, alpha=0.4, use_flow=True):
             state["prev"], state["gray"] = fr.copy(), gray
             continue
         if use_flow:
-            s = min(1.0, 1080.0 / max(h, w))
+            s = min(1.0, 540.0 / max(h, w))
             sw, sh = max(16, int(round(w * s))), max(16, int(round(h * s)))
             a_s = cv2.resize(pg, (sw, sh), interpolation=cv2.INTER_AREA)
             b_s = cv2.resize(gray, (sw, sh), interpolation=cv2.INTER_AREA)
@@ -656,7 +784,13 @@ def temporal_stabilize(frames, masks, state, alpha=0.4, use_flow=True):
         if outside.any():
             d = np.abs(warped.astype(np.int16) - fr.astype(np.int16)).mean(axis=2)
             ok = float((d[outside] < 28).mean())
-            if ok < 0.7:                 # 切镜/遮挡：不混合，免得把上一镜拖进来
+            # 整帧一致率只用来挡「切镜/大遮挡」；运动大的镜头整帧一致率天然低
+            # （实测运动帧 ok 常掉到 0.5 以下），一旦在这里否决，抖动最大的镜头
+            # 恰恰一点平滑都拿不到——所以开了逐像素可信度就只留一道粗闸。
+            if thr > 0:
+                if ok < 0.3:
+                    a0 = 0.0
+            elif ok < 0.7:
                 a0 = 0.0
             elif ok < 0.9:
                 a0 *= 0.5
@@ -670,6 +804,18 @@ def temporal_stabilize(frames, masks, state, alpha=0.4, use_flow=True):
                 rx0, rx1 = max(0, int(xs.min()) - mg), min(w, int(xs.max()) + mg + 1)
                 amap = cv2.GaussianBlur(region[ry0:ry1, rx0:rx1], (0, 0), 4.0)
                 amap = amap.astype(np.float32) * (a0 / 255.0)
+                if thr > 0:
+                    # 逐像素可信度看「背景对齐得好不好」，不看掩码内部：
+                    # 掩码内部是这一帧新填的内容，和上一帧填的本来就不一样（那就是
+                    # 要平滑掉的抖动），拿它自己判可信度等于把自己否掉。
+                    dd = np.abs(warped[ry0:ry1, rx0:rx1].astype(np.int16)
+                                - fr[ry0:ry1, rx0:rx1].astype(np.int16)).mean(axis=2)
+                    reg = region[ry0:ry1, rx0:rx1]
+                    good = ((dd < thr) & (reg == 0)).astype(np.float32)
+                    # 背景一致率的大范围均值当可信度：掩码内部本来就没有背景可比，
+                    # 用周围一圈的平均代替。原来用 TELEA 外推，单帧 162ms，太贵。
+                    conf = cv2.blur(good, (81, 81))
+                    amap = amap * np.clip(conf * 1.6, 0.0, 1.0)
                 a = amap[..., None]
                 sub = fr[ry0:ry1, rx0:rx1].astype(np.float32)
                 wsub = warped[ry0:ry1, rx0:rx1].astype(np.float32)

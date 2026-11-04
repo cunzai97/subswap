@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import os
 import tempfile
 import time
 
@@ -24,6 +25,7 @@ REF_PHOTO = 12.0
 REF_FEATHER = 1.0
 MODEL_FEATHER = 2.5
 MODEL_STAB = 0.45
+MODEL_STAB_THR = 24.0   # 逐像素时域混合的可信度阈值（差值 px，0=退回整帧统一混合）
 
 # 第三档（ProPainter）默认参数：阈值沿用 bench/video_inpaint/HYBRID_ROUTING.md
 PP_TEX = 16.0          # 背景 Laplacian 方差中位数 >= 16 → 难
@@ -31,6 +33,22 @@ PP_MOTION = 2.5        # 相邻帧灰度差中位数 >= 2.5 → 难
 PP_GUARD_MEAN = 20.0   # PP 与 LaMa 掩码内平均差 > 20 → 判 PP 幻觉，回退 LaMa
 PP_GUARD_P90 = 85.0    # 或 p90 > 85 → 回退
 PP_MAX_FRAMES = 900    # 单镜头最多送给 PP 的帧数（防止一镜到底的片子把耗时打爆）
+
+
+_TRACE_LOCK = None
+
+
+def _trace(path, rec):
+    """逐帧决策写 JSONL：哪帧走参考帧、哪帧进模型、光度差多少。默认关闭。"""
+    global _TRACE_LOCK
+    if not path:
+        return
+    import json
+    import threading
+    if _TRACE_LOCK is None:
+        _TRACE_LOCK = threading.Lock()
+    with _TRACE_LOCK, open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
 def tier_cfg(cfg):
@@ -330,6 +348,158 @@ def _active_frames(tracks, n, fps, t0):
     return int(active.sum())
 
 
+_TF_DIS_LOCAL = None
+
+
+def _tf_dis():
+    """DIS 对象不是线程安全的：pipe>1 时两个镜头线程共用同一个实例会段错误
+    （实测 2 路并发跑整片直接 core dump），所以按线程各建一个。"""
+    global _TF_DIS_LOCAL
+    if _TF_DIS_LOCAL is None:
+        import threading
+        _TF_DIS_LOCAL = threading.local()
+    dis = getattr(_TF_DIS_LOCAL, "dis", None)
+    if dis is None:
+        dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_ULTRAFAST)
+        _TF_DIS_LOCAL.dis = dis
+    return dis
+
+
+def _warp_band(dis, band_j, band_i, mk_j, cache=None):
+    """把邻居帧的原始 band 对齐到当前帧；返回 (warped, 有效像素) 或 (None, None)。"""
+    h, w = band_i.shape[:2]
+    ck = cache[0] if cache else None
+    cj = cache[1] if cache else None
+    if ck is not None and ("g", cj) in ck:
+        gj = ck[("g", cj)]
+    else:
+        gj = cv2.cvtColor(band_j, cv2.COLOR_BGR2GRAY)
+        if mk_j is not None and mk_j.any():
+            # 邻居自己的字幕也要先盖掉，否则光流被静止白字带偏。
+            # 只在掩码外接框里 inpaint：整带 TELEA 单帧要 50ms，是这条链路的瓶颈。
+            mj = cv2.dilate(mk_j, np.ones((15, 15), np.uint8))
+            ys, xs = np.where(mj > 0)
+            my0, my1 = max(0, int(ys.min()) - 12), min(h, int(ys.max()) + 13)
+            mx0, mx1 = max(0, int(xs.min()) - 12), min(w, int(xs.max()) + 13)
+            # 这里只要「光流别被白字带偏」，不需要高质量重建：大核中值模糊比
+            # TELEA 快一个量级（实测 TELEA 93ms/次，中值 6ms）。
+            sub = np.ascontiguousarray(gj[my0:my1, mx0:mx1])
+            ms = np.ascontiguousarray(mj[my0:my1, mx0:mx1])
+            med = cv2.medianBlur(sub, 31)
+            sub = np.where(ms > 0, med, sub)
+            gj[my0:my1, mx0:mx1] = sub
+        if ck is not None:
+            ck[("g", cj)] = gj
+    gi = cv2.cvtColor(band_i, cv2.COLOR_BGR2GRAY)
+    s_ = min(1.0, 1080.0 / max(h, w))
+    sw, sh = max(16, int(round(w * s_))), max(16, int(round(h * s_)))
+    a = cv2.resize(gj, (sw, sh), interpolation=cv2.INTER_AREA)
+    b = cv2.resize(gi, (sw, sh), interpolation=cv2.INTER_AREA)
+    fl = (dis or _tf_dis()).calc(b, a, None)
+    if (sw, sh) != (w, h):
+        fl = cv2.resize(fl, (w, h), interpolation=cv2.INTER_LINEAR) / s_
+    gx, gy = np.meshgrid(np.arange(w, dtype=np.float32),
+                         np.arange(h, dtype=np.float32))
+    wr = cv2.remap(band_j, gx + fl[..., 0], gy + fl[..., 1],
+                   cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    if mk_j is not None and mk_j.any():
+        mj = cv2.dilate(mk_j.astype(np.uint8), np.ones((9, 9), np.uint8))
+        valid = cv2.remap(mj, gx + fl[..., 0], gy + fl[..., 1],
+                          cv2.INTER_NEAREST, borderMode=cv2.BORDER_REPLICATE) == 0
+    else:
+        valid = np.ones((h, w), bool)
+    return wr, valid
+
+
+def _temporal_fill(P, band, k, fmm, mmm, mt, dis, flow_cache, radius, thr, log_ctx,
+                   zone=None, params=None):
+    """用邻近帧的**真实像素**补字幕区（时间维补洞）。
+
+    字幕在动、字也不同，同一个像素在前后几帧里往往有露出来的时刻。把这些真实
+    像素 warp 过来填，剩下的洞（几帧里都被字盖住）才交给 LaMa。相比整块让模型
+    凭空画，这块是真纹理、且随背景一起动——既不发糊也不抖。
+
+    性能：整个计算只做在掩码外接框（外扩 16px）里，原来在整条带上做 3 通道
+    中值排序，单帧要 0.3s 以上。
+    返回 (band, 剩余掩码, 真实像素覆盖率)。
+    """
+    h, w = band.shape[:2]
+    ys, xs = np.where(mt > 0)
+    if not ys.size:
+        return band, mt, 0.0
+    mg = 16
+    ry0, ry1 = max(0, int(ys.min()) - mg), min(h, int(ys.max()) + mg + 1)
+    rx0, rx1 = max(0, int(xs.min()) - mg), min(w, int(xs.max()) + mg + 1)
+    mts = mt[ry0:ry1, rx0:rx1] > 0
+    bs = band[ry0:ry1, rx0:rx1]
+    outs = mt[ry0:ry1, rx0:rx1] == 0
+
+    cands, valids = [], []
+    for d in range(1, int(radius) + 1):
+        for j in (k - d, k + d):   # 越近越先，挑像素时按这个顺序优先
+            if j < 0 or j >= len(mmm):
+                continue
+            key = (k, j)
+            wj, vj = flow_cache.get(key, (None, None))
+            if wj is None:
+                mkj = (mmm[j] > 0).astype(np.uint8) * 255
+                gk = flow_cache.get(("g", j))
+                wj, vj = _warp_band(None, np.asarray(fmm[j]), band, mkj,
+                                    cache=(flow_cache, j, k))
+                flow_cache[key] = (wj, vj)
+            if wj is None:
+                continue
+            wjs = wj[ry0:ry1, rx0:rx1]
+            if outs.any():
+                dd = np.abs(wjs.astype(np.int16) - bs.astype(np.int16)).mean(axis=2)
+                if float((dd[outs] < thr).mean()) < 0.55:
+                    continue
+            cands.append(wjs)
+            valids.append((vj[ry0:ry1, rx0:rx1]) & mts)
+    if not cands:
+        return band, mt, 0.0
+    stack = np.stack(cands).astype(np.int16)
+    vstack = np.stack(valids)
+    cnt = vstack.sum(axis=0)
+    sel = cnt > 0
+    if not sel.any():
+        return band, mt, 0.0
+    # 每个像素只要一个真实像素：按候选顺序（时间上从近到远）取第一个有效的。
+    # 原来按有效个数排序取中值，单帧要 20ms（4 个候选 ×3 通道全排序）。
+    chosen = np.full(stack.shape[1:], 999, np.int16)
+    for c, v in zip(stack, vstack):
+        chosen = np.where((chosen == 999) & v[..., None], c, chosen)
+    out = band.copy()
+    reg = out[ry0:ry1, rx0:rx1]
+    reg[sel] = np.clip(chosen[sel], 0, 255).astype(np.uint8)
+    out[ry0:ry1, rx0:rx1] = reg
+    filled = sel & mts
+    left = mt.copy()
+    left[ry0:ry1, rx0:rx1][filled] = 0
+    # 邻帧也可能没把字检全（弱字/描边）：填完再查一遍白字，还白的退回给 LaMa。
+    if filled.any():
+        bb, gg, rr = cv2.split(reg)
+        whiteish = ((bb > 185) & (gg > 185) & (rr > 185)
+                    & (np.abs(rr.astype(np.int16) - bb.astype(np.int16)) < 22))
+        back = whiteish & filled
+        if zone is not None and params is not None:
+            # 再用和第一遍同一个白字检测器扫一遍填完的图：弱字/描边靠固定阈值查不出来
+            try:
+                gl, tot, _mg, _kb = _glyph_mask(out, zone, params)
+                if tot >= params["min_px"]:
+                    gl = cv2.dilate(gl * 255, np.ones((max(3, params["min_h"] // 2),
+                                                       max(3, params["min_h"] // 2)),
+                                                      np.uint8))
+                    back = back | ((gl > 0) & filled)
+            except Exception:  # noqa: BLE001
+                pass
+        if back.any():
+            left[ry0:ry1, rx0:rx1][back] = 255
+            filled = filled & ~back
+    cov = float(filled.sum()) / max(1, int(mts.sum()))
+    return out, np.ascontiguousarray(left), cov
+
+
 def _pp_shot(P, fmm, mmm, todo, geo, pprect, tracks, shot, fps, tier, mcfg,
              mask_mode, cues, log):
     """对给定帧号跑 ProPainter。返回 {帧号: 裁片内擦除结果（BGR）}。
@@ -393,12 +563,7 @@ def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
     if n_exp <= 0:
         return 0, 0.0, 0.0, 0.0, "ref"
     bx0, by0, bx1, by1 = P._band_rect(tracks, w, h)
-    x0, y0, x1, y1 = bx0, by0, bx1, by1
-    # 参考填充需要比字幕框更大的背景做光流和光度校验；v6 直接用了整幅宽度。
-    cx = max(96, int(round(0.35 * (x1 - x0))))
-    cy = max(32, int(round(0.25 * (y1 - y0))))
-    x0, x1 = max(0, x0 - cx) & ~1, min(w, x1 + cx) & ~1
-    y0, y1 = max(0, y0 - cy) & ~1, min(h, y1 + cy) & ~1
+    x0, y0, x1, y1 = P.erase_band_rect(tracks, w, h)
     bw, bh = x1 - x0, y1 - y0
 
     mcfg = cfg["mask"]
@@ -411,8 +576,19 @@ def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
     ref_photo = float(ecfg.get("ref_photo", REF_PHOTO))
     ref_feather = float(ecfg.get("ref_feather", REF_FEATHER))
     model_feather = float(ecfg.get("model_feather", MODEL_FEATHER))
-    model_stab = float(ecfg.get("model_stab", MODEL_STAB))
+    model_stab = float(os.environ.get("VE_STAB_ALPHA")
+                       or ecfg.get("model_stab", MODEL_STAB))
+    stab_thr = float(os.environ.get("VE_STAB_THR")
+                     or ecfg.get("stab_thr", MODEL_STAB_THR))
+    stab_mode = os.environ.get("VE_STAB_MODE") or ecfg.get("stab_mode", "blend")
+    stab_radius = int(os.environ.get("VE_STAB_RADIUS")
+                      or ecfg.get("stab_radius", 1))
+    tf_radius = int(os.environ.get("VE_TF_RADIUS")
+                    or ecfg.get("tf_radius", 2))
+    tf_thr = float(os.environ.get("VE_TF_THR") or ecfg.get("tf_thr", 18.0))
     tier = tier_cfg(cfg)
+    import os as _os
+    trace_path = _os.environ.get("VE_ERASE_TRACE") or ""
 
     boxes = [b for tr in tracks for _, b in tr["boxes"]]
     if not boxes:
@@ -557,6 +733,7 @@ def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
         fmm = np.memmap(fpath, dtype=np.uint8, mode="r", shape=(n, bh, bw, 3))
         mmm = np.memmap(mpath, dtype=np.uint8, mode="r", shape=(n, bh, bw))
         dis = _make_dis()
+        tf_cache = {}
 
         # ---- 三级分流：一档参考帧填充（逐帧、真实像素）/ 二档 LaMa / 三档 ProPainter ----
         # 分类按「镜头」做，不按帧：模型逐帧切换会让纹理在帧间跳变，比字幕更显眼。
@@ -611,6 +788,7 @@ def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
         stab_state = {"prev": None, "gray": None}
         batch_size = max(1, int(cfg["inpaint"].get("batch", 8)))
         ref_n = model_n = raw_n = no_ref = photo_fail = masked_px = 0
+        tf_px = 0
         total = 0
         last_bytes = None
         buf, bands, model_masks, bidx = [], [], [], []
@@ -649,22 +827,31 @@ def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
                         else:
                             pp_st["rej"] += 1
             has_model = any(m is not None for m in model_masks)
-            if has_model:
+            if has_model and stab_mode == "median":
+                raws = [fr[y0:y1, x0:x1] for fr in buf]
+                bands[:] = P.temporal_median(bands, raws, model_masks, stab_state,
+                                             radius=int(stab_radius),
+                                             thr=stab_thr, use_flow=True)
+            elif has_model:
                 P.temporal_stabilize(
                     bands,
                     [(m.astype(np.uint8) * 255 if m is not None
                       else np.zeros((bh, bw), np.uint8)) for m in model_masks],
-                    stab_state, model_stab, use_flow=True)
+                    stab_state, model_stab, use_flow=True, thr=stab_thr)
             elif model_stab > 0:
                 # 没有模型帧的批次也要把状态推到最后一帧，
                 # 否则下一段模型帧会从几批之前的旧帧做光流，稳定性失真。
                 last = bands[-1]
                 stab_state["prev"] = last.copy()
                 stab_state["gray"] = cv2.cvtColor(last, cv2.COLOR_BGR2GRAY)
+            band_only = getattr(writer, "band_rect", None) is not None
             for fr, b in zip(buf, bands):
-                fr[y0:y1, x0:x1] = b
                 if total < n_exp:
-                    last_bytes = fr.tobytes()
+                    if band_only:
+                        last_bytes = np.ascontiguousarray(b).tobytes()
+                    else:
+                        fr[y0:y1, x0:x1] = b
+                        last_bytes = fr.tobytes()
                     writer.stdin.write(last_bytes)
                     total += 1
             buf.clear()
@@ -678,6 +865,7 @@ def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
             band = fr[y0:y1, x0:x1].copy()
             mref = mmm[k] > 0 if k < n else np.zeros((bh, bw), bool)
             mt = None
+            fmode, fphoto = "raw", None
             if k < n and run_of[k] >= 0 and mref.any():
                 masked_px += int(mref.sum())
                 run = runs[run_of[k]]
@@ -713,8 +901,11 @@ def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
                                       mfill, ref_feather)
                         filled = True
                         ref_n += 1
+                        fmode = "ref"
                     else:
                         photo_fail += 1
+                        fmode = "model"
+                        fphoto = round(float(d), 2)
                 if not filled:
                     mt = P.track_mask(band, tracks, shot["start"] + k / fps,
                                       x0, y0, mask_mode, pad=pad, dilate=dilate,
@@ -724,11 +915,30 @@ def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
                     mt = mt & (_active_limit(
                         P, bh, bw, tracks, shot["start"] + k / fps,
                         x0, y0, pad, cues=cues) > 0)
-                    if r is None:
-                        no_ref += 1
-                    model_n += 1
+                    if tf_radius > 0 and mt.any():
+                        # 先用相邻帧的真实像素把字幕区补掉（时间维补洞），
+                        # 补不掉的洞才交给 LaMa——这块是真纹理，不糊也不抖。
+                        band, mt_u8, tf_cov = _temporal_fill(
+                            P, band, k, fmm, mmm, mt.astype(np.uint8), dis,
+                            tf_cache, tf_radius, tf_thr, None,
+                            zone=zone, params=params)
+                        if tf_cov > 0:
+                            tf_px += int((mt & ~(mt_u8 > 0)).sum())
+                            if not (mt_u8 > 0).any():
+                                mt = None
+                            else:
+                                mt = mt_u8 > 0
+                    if mt is not None:
+                        if r is None:
+                            no_ref += 1
+                            fmode = "model"
+                        model_n += 1
             else:
                 raw_n += 1
+            if trace_path:
+                _trace(trace_path, {"shot": round(shot["start"], 2), "k": k,
+                                    "t": round(shot["start"] + k / fps, 2),
+                                    "mode": fmode, "photo": fphoto})
             buf.append(fr)
             bands.append(band)
             model_masks.append(mt)
@@ -744,6 +954,8 @@ def erase_shot_ref(P, model, path, shot, tracks, meta, writer, cfg,
     dt = time.time() - t_start
     coverage = masked_px / max(total * bh * bw, 1)
     pp_txt = ""
+    if tf_px:
+        pp_txt += f"  邻帧补 {tf_px}px"
     if pp_st["ok"] or pp_st["rej"]:
         pp_txt = f"  PP {pp_st['ok']}（回退 {pp_st['rej']}）"
     P.log(f"    ref {ref_n} / model {model_n}（无参考 {no_ref}，光度 {photo_fail}）"

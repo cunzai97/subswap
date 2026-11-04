@@ -635,13 +635,27 @@ def erase(src: Path, meta, layout, shots, per_shot, cfg, on_prog, log,
     n_shots = 0
     p_lock = threading.Lock()
 
+    # 只喂字幕带的中间层：ffmpeg 自己解码源片、把带贴回去再编码。
+    # 省掉 Python 侧每帧 6.2MB 的整帧搬运（实测见 docs/ERASE_WRITE_OVERLAY.md）。
+    write_mode = (os.environ.get("ERASE_WRITE")
+                  or ((cfg or {}).get("worker") or {}).get("erase_write") or "full")
+    overlay_ok = (str(write_mode).lower() == "overlay"
+                  and str(((cfg or {}).get("erase") or {}).get("engine", "ref")) != "legacy")
+
     def run_shot(i, force_x264=False):
         """返回 (镜头号, 帧数, 是否走了擦除, 模式)；异常原样抛出。"""
         shot = shots[i]
-        writer = P.open_writer(str(segs[i]), meta["w"], meta["h"], meta["fps"],
-                               force_x264=force_x264)
+        tracks = filter_tracks_by_layout(per_shot[i], layout, meta)
+        band = P.erase_band_rect(tracks, meta["w"], meta["h"]) \
+            if (overlay_ok and tracks) else None
+        if band is not None:
+            writer = P.open_overlay_writer(str(segs[i]), src, meta, shot["start"],
+                                           shot["end"] - shot["start"], band,
+                                           force_x264=force_x264)
+        else:
+            writer = P.open_writer(str(segs[i]), meta["w"], meta["h"], meta["fps"],
+                                   force_x264=force_x264)
         try:
-            tracks = filter_tracks_by_layout(per_shot[i], layout, meta)
             if not tracks:
                 n = int(round(shot["end"] * meta["fps"])) - int(round(shot["start"] * meta["fps"]))
                 last = None
@@ -1020,6 +1034,9 @@ def auto_repair(erased, meta, layout, shots, per_shot, source, cfg, work, log,
         rcfg.setdefault("inpaint", {})
         rcfg["inpaint"]["fixed_w"] = max(int(rcfg["inpaint"].get("fixed_w", 1024)), 1024)
         rcfg["inpaint"]["fixed_h"] = 256
+        # 返修这一轮不用邻帧补洞：补洞依赖邻居的真实像素，遇到描边/阴影会把残影再贴回来，
+        # 返修就该用最稳的纯模型重擦（掩码已经放大了）。
+        rcfg.setdefault("erase", {})["tf_radius"] = 0
         try:
             _n, pf = patch_erased(
                 erased, out, meta, shots, per_shot, scan["suspects"], layout, rcfg,
