@@ -59,18 +59,37 @@ def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+_OCR_OPTS: dict = {}
+
+
+def set_ocr_opts(**kw):
+    """覆盖 det 输入尺寸等参数（convert.extract 从 config.yaml:ocr 传进来）。
+
+    rapidocr 默认 `det_limit_type=min, det_limit_side_len=736`：它会把**短边**放大到
+    736——字幕带只有 192px 高时等于放大 3.8 倍再检测，实测 211ms/帧；改成
+    `max/960`（长边封顶）后同一帧 28ms，快了 7.5 倍，字高 63px 还剩 56px。
+    """
+    global OCR
+    add = {k: v for k, v in kw.items() if v is not None}
+    if add and any(_OCR_OPTS.get(k) != v for k, v in add.items()):
+        _OCR_OPTS.update(add)
+        OCR = None  # 参数变了必须重建会话，否则老进程里生效不了
+
+
 def get_ocr():
     global OCR
     if OCR is None:
         from rapidocr_onnxruntime import RapidOCR
+        kw = dict(_OCR_OPTS)
         if os.environ.get("OCR_USE_CUDA", "1") == "1":
             try:
-                OCR = RapidOCR(det_use_cuda=True, rec_use_cuda=True, cls_use_cuda=True)
+                OCR = RapidOCR(det_use_cuda=True, rec_use_cuda=True, cls_use_cuda=True,
+                               **kw)
             except Exception as e:  # noqa: BLE001
                 log(f"OCR GPU 初始化失败，退回 CPU：{e}")
-                OCR = RapidOCR()
+                OCR = RapidOCR(**kw)
         else:
-            OCR = RapidOCR()
+            OCR = RapidOCR(**kw)
     return OCR
 
 
@@ -161,30 +180,41 @@ def detect_shots(path, dur, thr=0.16, min_shot=0.5):
     return shots
 
 
-def ocr_boxes(frame, band, y_off=0, min_w_frac=0.05):
+def ocr_boxes(frame, band, y_off=0, min_w_frac=0.05, max_w=0):
     """只在字幕带里跑 OCR：面积小一半，速度约 1.8 倍
     frame 可以是整帧，也可以是已裁好的字幕带（此时 band=(0,1), y_off=裁切起点）
-    min_w_frac=0 时不按宽度过滤，用于复查残留的单字"""
+    min_w_frac=0 时不按宽度过滤，用于复查残留的单字
+    max_w>0 时先把字幕带等比缩到该宽度再识别：det 成本随面积走，1080→720 约快
+    2.5 倍，字幕字高 60px 缩完还有 40px，远高于识别下限；框按比例还原。
+    """
     global OCR
     h, w = frame.shape[:2]
     fb0, fb1 = int(h * band[0]), int(h * band[1])
     yb0, yb1 = fb0 + y_off, fb1 + y_off
+    strip = frame[fb0:fb1]
+    scale = 1.0
+    if max_w and strip.shape[1] > max_w:
+        scale = max_w / float(strip.shape[1])
+        strip = cv2.resize(strip, (int(round(strip.shape[1] * scale)),
+                                   int(round(strip.shape[0] * scale))),
+                           interpolation=cv2.INTER_AREA)
     try:
-        res, _ = get_ocr()(frame[fb0:fb1])
+        res, _ = get_ocr()(strip, use_cls=False)
     except Exception as e:  # noqa: BLE001  cuDNN FE 偶发失败，整进程退回 CPU
         log(f"OCR 推理失败，退回 CPU：{type(e).__name__} {str(e)[:120]}")
         OCR = None
         os.environ["OCR_USE_CUDA"] = "0"
-        res, _ = get_ocr()(frame[fb0:fb1])
+        res, _ = get_ocr()(strip, use_cls=False)
+    inv = 1.0 / scale
     out = []
     for box, text, score in (res or []):
         if score < OCR_MIN_SCORE:
             continue
         xs = [p[0] for p in box]
         ys = [p[1] for p in box]
-        x0, x1 = max(0, int(min(xs))), min(w, int(max(xs)))
-        y0 = max(0, int(min(ys))) + yb0
-        y1 = min(h + y_off, int(max(ys)) + yb0)
+        x0, x1 = max(0, int(min(xs) * inv)), min(w, int(max(xs) * inv))
+        y0 = max(0, int(min(ys) * inv)) + yb0
+        y1 = min(h + y_off, int(max(ys) * inv) + yb0)
         if x1 - x0 < min_w_frac * w:
             continue
         out.append(((x0, y0, x1, y1), text.strip(), float(score)))
@@ -328,11 +358,17 @@ def _box_at(tr, t):
 
 
 def analyze_shot(path, shot, meta, band, sample_fps=2.0, mask_mode="stroke",
-                 keep_any_text=False):
+                 keep_any_text=False, ocr_max_w=0, reuse_static=True,
+                 static_thr=2.5):
     """抽样 OCR → 按 IoU 串成文字轨（tracks），取代整镜头并集掩码
 
     注意：不用 ffmpeg 的 fps 滤镜抽样——它会把首帧推到区间边界（实测偏 0.2~0.5s），
     这里按原始帧率解码、每 step 帧取一帧，时间戳才准。
+
+    ocr_max_w：识别前把字幕带等比缩到的宽度（0=不缩）。det 成本随面积走。
+    reuse_static：字幕带和上一帧几乎一样时直接复用上一帧的识别结果——一条字幕
+        通常持续 2~4s，4fps 下就是 8~16 次重复识别，实测能省掉一半以上的 OCR。
+        判据是灰度平均绝对差 ≤ static_thr，淡入淡出/换行都会超阈值重新识别。
     """
     w, h, fps = meta["w"], meta["h"], meta["fps"]
     fb0 = int(h * band[0]) & ~1
@@ -341,13 +377,26 @@ def analyze_shot(path, shot, meta, band, sample_fps=2.0, mask_mode="stroke",
     step = max(1, int(round(fps / sample_fps)))
     dt = step / fps
     tracks = []
+    prev_gray = None
+    prev_boxes = None
     for k, fr in enumerate(iter_frames(path, w, ch, shot["start"],
                                        shot["end"] - shot["start"], None,
                                        crop=(0, fb0, w, ch))):
         if k % step:
             continue
         t = shot["start"] + k / fps
-        for box, text, score in ocr_boxes(fr, (0.0, 1.0), y_off=fb0):
+        boxes = None
+        if reuse_static and prev_gray is not None:
+            g = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY)
+            if float(cv2.absdiff(g, prev_gray).mean()) <= static_thr:
+                boxes = prev_boxes
+            prev_gray = g
+        if boxes is None:
+            boxes = ocr_boxes(fr, (0.0, 1.0), y_off=fb0, max_w=ocr_max_w)
+            if reuse_static:
+                prev_gray = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY)
+            prev_boxes = boxes
+        for box, text, score in boxes:
             best, bi = None, 0.35
             cur_cjk = "".join(CJK_RE.findall(text or ""))
             cur_key = cur_cjk if not keep_any_text else norm_text(text)[:10]
@@ -427,12 +476,13 @@ def nvenc_ok():
     return _NVENC_OK
 
 
-def open_writer(path, w, h, fps):
+def open_writer(path, w, h, fps, force_x264=False):
     cmd = ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
            "-s", f"{w}x{h}", "-r", f"{fps:g}", "-i", "-", "-an"]
     # 中间层默认 NVENC：与 x264 crf14 实测 PSNR 50.9dB/SSIM 0.995，快 3.6 倍，
     # 把 CPU 留给 OCR/光流；ERASE_WRITER=x264 可强制回软编。
-    if os.environ.get("ERASE_WRITER", "auto").lower() != "x264" and nvenc_ok():
+    if not force_x264 and os.environ.get("ERASE_WRITER", "auto").lower() != "x264" \
+            and nvenc_ok():
         cq = os.environ.get("ERASE_NVENC_CQ", "14")
         cmd += ["-c:v", "h264_nvenc", "-preset", "p5", "-cq", str(cq), "-b:v", "0"]
     else:

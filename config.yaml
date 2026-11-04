@@ -45,6 +45,11 @@ shot:
 ocr:
   use_cuda: true
   sample_fps: 4
+  det_limit_side_len: 960  # det 输入长边上限（rapidocr 默认 min/736 会把字幕带放大 3.8 倍）
+  det_limit_type: max      # min=短边放大（默认，慢 7.5 倍）| max=长边封顶
+  max_w: 0              # 识别前再缩一道（实测 det 已封顶后没收益，留 0）
+  reuse_static: true    # 字幕带几乎没变的帧直接复用上一帧的识别结果
+  static_thr: 2.5       # 上面那个「几乎没变」的灰度平均绝对差阈值
 
 vad:
   enable: true

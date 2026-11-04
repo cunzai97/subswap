@@ -446,8 +446,14 @@ def strip_scene_latin(cues):
     return out
 
 
-def extract(src: Path, meta, layout, source, log, on_prog=None):
+def extract(src: Path, meta, layout, source, log, on_prog=None, ocr=None):
     band = tuple(layout["band"])
+    ocfg = ocr or {}
+    ocr_max_w = int(ocfg.get("max_w", 0) or 0)
+    reuse_static = bool(ocfg.get("reuse_static", True))
+    static_thr = float(ocfg.get("static_thr", 2.5))
+    P.set_ocr_opts(det_limit_side_len=ocfg.get("det_limit_side_len"),
+                   det_limit_type=ocfg.get("det_limit_type"))
     shots = P.detect_shots(str(src), meta["dur"])
     log(f"拆条：{len(shots)} 个镜头")
     all_cues = []
@@ -455,7 +461,9 @@ def extract(src: Path, meta, layout, source, log, on_prog=None):
     for i, shot in enumerate(shots):
         keep_any = source != "zh"
         tracks, cues = P.analyze_shot(str(src), shot, meta, band, sample_fps=4.0,
-                                      keep_any_text=keep_any)
+                                      keep_any_text=keep_any,
+                                      ocr_max_w=ocr_max_w, reuse_static=reuse_static,
+                                      static_thr=static_thr)
         tracks = filter_tracks_by_layout(tracks, layout, meta)
         if source == "zh":
             tracks = filter_tracks_cjk(tracks)
@@ -627,10 +635,11 @@ def erase(src: Path, meta, layout, shots, per_shot, cfg, on_prog, log,
     n_shots = 0
     p_lock = threading.Lock()
 
-    def run_shot(i):
+    def run_shot(i, force_x264=False):
         """返回 (镜头号, 帧数, 是否走了擦除, 模式)；异常原样抛出。"""
         shot = shots[i]
-        writer = P.open_writer(str(segs[i]), meta["w"], meta["h"], meta["fps"])
+        writer = P.open_writer(str(segs[i]), meta["w"], meta["h"], meta["fps"],
+                               force_x264=force_x264)
         try:
             tracks = filter_tracks_by_layout(per_shot[i], layout, meta)
             if not tracks:
@@ -674,15 +683,26 @@ def erase(src: Path, meta, layout, shots, per_shot, cfg, on_prog, log,
                         f"镜头 {n_shots}/{len(shots)}（完成 #{i + 1}）· {mode} · "
                         f"{total_frames / el:.1f} fps")
 
+    def safe_shot(i):
+        """单个镜头失败时换软编重试一次：并发高时 NVENC 抢不到会话/显存，
+        直接抛会让整支片白跑（实测 4 路并发时 ep07 镜头 74 就这样挂过）。"""
+        try:
+            return run_shot(i)
+        except Exception as e:  # noqa: BLE001
+            if os.environ.get("ERASE_WRITER", "auto").lower() == "x264":
+                raise
+            log(f"镜头 {i} 失败（{type(e).__name__}），改用 x264 中间层重试")
+            return run_shot(i, force_x264=True)
+
     if pipe > 1 and len(shots) > 1:
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=pipe, thread_name_prefix="erase") as ex:
-            futs = [ex.submit(run_shot, i) for i in range(len(shots))]
+            futs = [ex.submit(safe_shot, i) for i in range(len(shots))]
             for fu in futs:
                 collect(*fu.result())
     else:
         for i in range(len(shots)):
-            collect(*run_shot(i))
+            collect(*safe_shot(i))
     _concat_segments(segs, erased, meta, log, expected=total_frames)
     return erased
 
@@ -1442,6 +1462,14 @@ def prepare(job_dir: Path, opts: dict, log, on_stage=None):
     meta = P.probe(str(src))
     log(f"素材 {meta['w']}x{meta['h']} @{meta['fps']:.3g}fps {meta['dur']:.1f}s")
 
+    # OCR 参数要先落地：版面探测自己就会建会话，晚设置等于不生效
+    _ocr_cfg = cfg.get("ocr") or {}
+    P.set_ocr_opts(
+        det_limit_side_len=int(os.environ.get("VE_OCR_DET_LEN")
+                               or _ocr_cfg.get("det_limit_side_len") or 0) or None,
+        det_limit_type=os.environ.get("VE_OCR_DET_TYPE")
+        or _ocr_cfg.get("det_limit_type"))
+
     stage("探测字幕位置", 0.06)
     layout = detect_layout(src, meta, log)
 
@@ -1449,7 +1477,8 @@ def prepare(job_dir: Path, opts: dict, log, on_stage=None):
     stage("读取字幕", 0.1)
     cues, source, shots, per_shot = extract(
         src, meta, layout, source, log,
-        on_prog=lambda f: stage("读取字幕", 0.1 + 0.15 * f))
+        on_prog=lambda f: stage("读取字幕", 0.1 + 0.15 * f),
+        ocr=cfg.get("ocr"))
     if not cues:
         raise RuntimeError("素材里没找到字幕，无法确定要擦除/翻译的内容")
 

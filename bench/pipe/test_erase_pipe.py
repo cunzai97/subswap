@@ -86,7 +86,7 @@ def run(pipe, fail_at=None):
         return 25, 1.0, 25.0, 0.1, "ref"
 
     P.iter_frames = fake_iter
-    P.open_writer = lambda p, w, h, fps: FakeWriter(p)
+    P.open_writer = lambda p, w, h, fps, force_x264=False: FakeWriter(p)
     P.erase_shot = fake_erase_shot
     C.get_model = lambda cfg=None: FakeModel()
     C.filter_tracks_by_layout = lambda tracks, layout, meta: tracks
